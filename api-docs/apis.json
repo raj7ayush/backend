@@ -1,0 +1,53 @@
+[
+  {
+    "name": "Manage",
+    "path": "/umi/v1/ReqManage",
+    "method": "POST",
+    "description": "Manage method will process the request based on the type and action and return error if any, This will be used to manage assets like lock, unlock, burn the assets on DLT.",
+    "fields": [
+      {"name": "manage", "type": "xml", "description": "manage payload"}
+    ]
+  },
+  {
+    "name": "Issue",
+    "path": "/umi/v1/ReqIssue",
+    "method": "POST",
+    "description": "Issue method will process the request based on the type and action and return error if any, This will be used to issue/create new assets on DLT.",
+    "fields": [
+      {"name": "issue", "type": "xml", "description": "issue payload"}
+    ]
+  },
+  {
+    "name": "Settle",
+    "path": "/umi/v1/ReqSettle",
+    "method": "POST",
+    "description": "Settle method will process the request based on the requestType and requestAction and return error if any, This will be used for inter network asset trade custom instructions in coordinator, It will be used to transfer one asset from one organization to another",
+    "fields": [
+      {"name": "settle", "type": "xml", "description": "settle payload"}
+    ]
+  },
+  {
+    "name": "Transact",
+    "path": "/umi/v1/ReqTransact",
+    "method": "POST",
+    "description": "Transact method  will process the request based on the type and action and return error if any, This will be used to create transactions on DLT.",
+    "fields": [
+      {"name": "transact", "type": "xml", "description": "transact payload"}
+    ]
+  },
+  {
+    "name": "Query",
+    "path": "/umi/v1/ReqQuery",
+    "method": "POST",
+    "description": "Query method will fetch data from chaincode and return the response, This will support both normal query and rich query on DLT.",
+    "fields": [
+      {"name": "query", "type": "xml", "description": "query payload"}
+    ]
+  },
+  {
+    "name": "Healthz",
+    "path": "/umi/v1/Healthz",
+    "method": "GET",
+    "description": "Healthz method will return 200 status code if the FSP service is up."
+  }
+]
