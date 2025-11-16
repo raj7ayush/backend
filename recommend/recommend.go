@@ -657,3 +657,222 @@ func HandleCreateAssetPrompt(ctx context.Context, prompt string, llm llms.Model)
 	xml := RenderAssetXML(values)
 	fmt.Println("Sample Payload:\n", xml)
 }
+
+// QueryInfo tracks the required information for API recommendation
+type QueryInfo struct {
+	IsAsync        *bool   // nil = unknown, true/false = known
+	IsUMICompliant *bool   // nil = unknown, true/false = known
+	IsPrivate      *bool   // nil = unknown, true = private, false = public
+	FieldNames     []string // empty = no fields provided
+}
+
+// ClassifyQuery determines if the user is asking to create something or asking about a field
+func ClassifyQuery(ctx context.Context, userInput, history string, llm llms.Model) (bool, error) {
+	// Check if user is asking about a field (not creating)
+	classificationPrompt := fmt.Sprintf(`Analyze the following user query and determine if they are:
+1. Asking to CREATE something (e.g., "I want to create a gold bond", "create asset", "make a transaction")
+2. Asking ABOUT a field or property (e.g., "what is toWalletAddress?", "explain id field", "what does async mean?")
+
+User query: %q
+Conversation history: %s
+
+Return ONLY a JSON object with this structure:
+{
+  "is_creation_request": true or false,
+  "reason": "brief explanation"
+}
+
+If the user is asking about a field, property, or explanation, set is_creation_request to false.
+If the user is asking to create, make, or generate something, set is_creation_request to true.`, userInput, history)
+
+	response, err := llms.GenerateFromSinglePrompt(ctx, llm, classificationPrompt, llms.WithTemperature(0.0))
+	if err != nil {
+		return false, err
+	}
+
+	var result struct {
+		IsCreationRequest bool   `json:"is_creation_request"`
+		Reason            string `json:"reason"`
+	}
+
+	if err := json.Unmarshal([]byte(extractJSON(response)), &result); err != nil {
+		// Fallback: check for common creation keywords
+		lower := strings.ToLower(userInput)
+		creationKeywords := []string{"create", "make", "generate", "build", "new", "want to", "need to"}
+		for _, keyword := range creationKeywords {
+			if strings.Contains(lower, keyword) {
+				// Check if it's not a question about the keyword itself
+				questionWords := []string{"what is", "what does", "explain", "tell me about", "how does"}
+				isQuestion := false
+				for _, qw := range questionWords {
+					if strings.Contains(lower, qw) {
+						isQuestion = true
+						break
+					}
+				}
+				if !isQuestion {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}
+
+	return result.IsCreationRequest, nil
+}
+
+// ExtractQueryInfo extracts the 4 required pieces of information from conversation
+func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.Model) (*QueryInfo, error) {
+	extractionPrompt := fmt.Sprintf(`Analyze the conversation and extract the following information:
+
+User query: %q
+Conversation history: %s
+
+Extract:
+1. Is it async? (look for "async", "asynchronous", "yes/no" answers)
+2. Is it UMI compliant? (look for "UMI compliant", "UMI", "yes/no" answers)
+3. Is it private or public? (look for "private", "public", "yes/no" answers)
+4. Field names mentioned (any field names like id, value, key, toWalletAddress, etc.)
+
+Return ONLY a JSON object:
+{
+  "is_async": true/false/null,
+  "is_umi_compliant": true/false/null,
+  "is_private": true/false/null,
+  "field_names": ["field1", "field2", ...]
+}
+
+Use null if the information is not found or unclear.`, userInput, history)
+
+	response, err := llms.GenerateFromSinglePrompt(ctx, llm, extractionPrompt, llms.WithTemperature(0.0))
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		IsAsync        *bool    `json:"is_async"`
+		IsUMICompliant *bool    `json:"is_umi_compliant"`
+		IsPrivate      *bool    `json:"is_private"`
+		FieldNames     []string `json:"field_names"`
+	}
+
+	if err := json.Unmarshal([]byte(extractJSON(response)), &result); err != nil {
+		// Fallback: simple keyword matching
+		info := &QueryInfo{}
+		lower := strings.ToLower(userInput + " " + history)
+		
+		// Check for async (handle both yes and no)
+		if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
+			// Check for negative indicators
+			asyncFalse := strings.Contains(lower, "not async") || 
+				strings.Contains(lower, "no async") || 
+				strings.Contains(lower, "async: no") ||
+				strings.Contains(lower, "async=false")
+			if asyncFalse {
+				asyncFalseVal := false
+				info.IsAsync = &asyncFalseVal
+			} else {
+				asyncTrue := true
+				info.IsAsync = &asyncTrue
+			}
+		}
+		
+		// Check for UMI compliant (handle both yes and no)
+		if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") || strings.Contains(lower, "umi") {
+			// Check for negative indicators
+			umiFalse := strings.Contains(lower, "not umi") || 
+				strings.Contains(lower, "no umi") || 
+				strings.Contains(lower, "umi: no") ||
+				strings.Contains(lower, "umi=false")
+			if umiFalse {
+				umiFalseVal := false
+				info.IsUMICompliant = &umiFalseVal
+			} else {
+				umiTrue := true
+				info.IsUMICompliant = &umiTrue
+			}
+		}
+		
+		// Check for private/public
+		if strings.Contains(lower, "private") && !strings.Contains(lower, "public") {
+			privateTrue := true
+			info.IsPrivate = &privateTrue
+		} else if strings.Contains(lower, "public") {
+			privateFalse := false
+			info.IsPrivate = &privateFalse
+		}
+		
+		// Try to extract field names from common patterns
+		// This is a simple heuristic - the LLM-based extraction is preferred
+		commonFields := []string{"id", "value", "key", "toWalletAddress", "fromWalletAddress", 
+			"walletAddress", "requestId", "msgId", "name", "type"}
+		for _, field := range commonFields {
+			if strings.Contains(lower, field) {
+				info.FieldNames = append(info.FieldNames, field)
+			}
+		}
+		
+		return info, nil
+	}
+
+	return &QueryInfo{
+		IsAsync:        result.IsAsync,
+		IsUMICompliant: result.IsUMICompliant,
+		IsPrivate:      result.IsPrivate,
+		FieldNames:     result.FieldNames,
+	}, nil
+}
+
+// GenerateFollowUpQuestions generates questions for missing information
+func GenerateFollowUpQuestions(ctx context.Context, info *QueryInfo, llm llms.Model) (string, error) {
+	var missing []string
+	
+	if info.IsAsync == nil {
+		missing = append(missing, "Is this request async? (yes/no)")
+	}
+	if info.IsUMICompliant == nil {
+		missing = append(missing, "Is this UMI compliant? (yes/no)")
+	}
+	if info.IsPrivate == nil {
+		missing = append(missing, "Is this private or public?")
+	}
+	if len(info.FieldNames) == 0 {
+		missing = append(missing, "Please provide at least one field name for the payload (e.g., id, value, key, toWalletAddress, etc.)")
+	}
+
+	if len(missing) == 0 {
+		return "", nil
+	}
+
+	questionPrompt := fmt.Sprintf(`Generate a friendly, conversational follow-up question asking for the following missing information:
+%s
+
+Return ONLY the question text, be concise and friendly.`, strings.Join(missing, "\n"))
+
+	response, err := llms.GenerateFromSinglePrompt(ctx, llm, questionPrompt, llms.WithTemperature(0.3))
+	if err != nil {
+		// Fallback: simple question
+		return "To help you better, I need a few more details:\n" + strings.Join(missing, "\n"), nil
+	}
+
+	return strings.TrimSpace(response), nil
+}
+
+// AnswerFieldQuestion answers questions about fields without suggesting APIs
+func AnswerFieldQuestion(ctx context.Context, userInput, history string, llm llms.Model) (string, error) {
+	answerPrompt := fmt.Sprintf(`You are a helpful API documentation assistant. The user is asking about a field or property.
+
+User question: %q
+Conversation history: %s
+
+Answer the question clearly and concisely. Do NOT suggest any APIs or generate payloads. Just explain what the field is, what it does, or answer their question directly.
+
+If you don't know the answer, say so politely.`, userInput, history)
+
+	response, err := llms.GenerateFromSinglePrompt(ctx, llm, answerPrompt, llms.WithTemperature(0.3))
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(response), nil
+}

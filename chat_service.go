@@ -105,14 +105,51 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 		}
 	}
 
-	prompt := composeConversationAwareRequest(history, userInput)
-
-	api, fields, samplePayload, err := recommend.Recommend1(ctx, s.apis, prompt)
+	// Classify the query: is it a creation request or a field question?
+	isCreationRequest, err := recommend.ClassifyQuery(ctx, userInput, history, s.model)
 	if err != nil {
-		return "", trimmedSession, err
+		// If classification fails, default to creation request to maintain backward compatibility
+		isCreationRequest = true
 	}
 
-	response := formatRecommendation(api, fields, samplePayload)
+	var response string
+
+	if !isCreationRequest {
+		// User is asking about a field - answer without suggesting APIs
+		response, err = recommend.AnswerFieldQuestion(ctx, userInput, history, s.model)
+		if err != nil {
+			return "", trimmedSession, fmt.Errorf("answer field question: %w", err)
+		}
+	} else {
+		// User wants to create something - check if we have all required information
+		queryInfo, err := recommend.ExtractQueryInfo(ctx, userInput, history, s.model)
+		if err != nil {
+			return "", trimmedSession, fmt.Errorf("extract query info: %w", err)
+		}
+
+		// Check if all 4 required pieces of information are present
+		hasAllInfo := queryInfo.IsAsync != nil &&
+			queryInfo.IsUMICompliant != nil &&
+			queryInfo.IsPrivate != nil &&
+			len(queryInfo.FieldNames) > 0
+
+		if !hasAllInfo {
+			// Generate follow-up questions for missing information
+			questions, err := recommend.GenerateFollowUpQuestions(ctx, queryInfo, s.model)
+			if err != nil {
+				return "", trimmedSession, fmt.Errorf("generate follow-up questions: %w", err)
+			}
+			response = questions
+		} else {
+			// All information is present - proceed with API recommendation
+			prompt := composeConversationAwareRequest(history, userInput)
+			api, fields, samplePayload, err := recommend.Recommend1(ctx, s.apis, prompt)
+			if err != nil {
+				return "", trimmedSession, err
+			}
+			response = formatRecommendation(api, fields, samplePayload)
+		}
+	}
 
 	if err := conversationChain.Memory.SaveContext(ctx,
 		map[string]any{"input": userInput},
