@@ -20,7 +20,7 @@ type Selection struct {
 func Recommend(ctx context.Context, apis []model.APIDoc, user string) (model.APIDoc, []model.APIField, string, error) {
 	llm, err := llm.NewGroqLLM()
 	if err != nil {
-		return model.APIDoc{}, nil, "", err
+		return model.APIDoc{}, nil, "", "", err
 	}
 
 	apiSummaries := make([]string, len(apis))
@@ -41,17 +41,17 @@ Return ONLY valid JSON with shape: {"api_index": <int>}
 	apiJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, pickPrompt,
 		llms.WithTemperature(0.0))
 	if err != nil {
-		return model.APIDoc{}, nil, "", err
+		return model.APIDoc{}, nil, "", "", err
 	}
 
 	var step1 struct {
 		APIIndex int `json:"api_index"`
 	}
 	if err := json.Unmarshal([]byte(extractJSON(apiJSON)), &step1); err != nil {
-		return model.APIDoc{}, nil, "", fmt.Errorf("parse API index: %w; raw=%s", err, apiJSON)
+		return model.APIDoc{}, nil, "", "", fmt.Errorf("parse API index: %w; raw=%s", err, apiJSON)
 	}
 	if step1.APIIndex < 0 || step1.APIIndex >= len(apis) {
-		return model.APIDoc{}, nil, "", errors.New("api_index out of range")
+		return model.APIDoc{}, nil, "", "", errors.New("api_index out of range")
 	}
 	chosen := apis[step1.APIIndex]
 		
@@ -73,12 +73,12 @@ Return ONLY valid JSON with shape: {"field_index": [<int>, ...]}
 	fieldsJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, fieldsPrompt,
 		llms.WithTemperature(0.0))
 	if err != nil {
-		return model.APIDoc{}, nil, "", err
+		return model.APIDoc{}, nil, "", "", err
 	}
 
 	var step2 Selection
 	if err := json.Unmarshal([]byte(extractJSON(fieldsJSON)), &step2); err != nil {
-		return model.APIDoc{}, nil, "", fmt.Errorf("parse field_index: %w; raw=%s", err, fieldsJSON)
+		return model.APIDoc{}, nil, "", "", fmt.Errorf("parse field_index: %w; raw=%s", err, fieldsJSON)
 	}
 
 	var picked []model.APIField
@@ -230,12 +230,265 @@ Generate only the payload (JSON or XML as per user request). Add explanations, n
 	payloadResp, err := llms.GenerateFromSinglePrompt(ctx, llm, payloadPrompt,
 		llms.WithTemperature(0.2))
 	if err != nil {
-		return chosen, picked, "", err
+		return chosen, picked, "", "", err
 	}
 
 	samplePayload := strings.TrimSpace(payloadResp)
 
-	return chosen, picked, samplePayload, nil
+	return chosen, picked, samplePayload, "", nil
+}
+
+// Recommend1 is the updated version that supports event payloads for async requests
+func Recommend1(ctx context.Context, apis []model.APIDoc, user string, queryInfo *QueryInfo) (model.APIDoc, []model.APIField, string, string, error) {
+	llm, err := llm.NewGroqLLM()
+	if err != nil {
+		return model.APIDoc{}, nil, "", "", err
+	}
+
+	apiSummaries := make([]string, len(apis))
+	for i, a := range apis {
+		apiSummaries[i] = fmt.Sprintf("[%d] %s %s - %s", i, a.Method, a.Path, a.Description)
+	}
+
+	pickPrompt := fmt.Sprintf(`You are selecting the best API for the user's request.
+
+APIs:
+%s
+
+User request: %q
+
+Return ONLY valid JSON with shape: {"api_index": <int>}
+`, strings.Join(apiSummaries, "\n"), user)
+
+	apiJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, pickPrompt,
+		llms.WithTemperature(0.0))
+	if err != nil {
+		return model.APIDoc{}, nil, "", "", err
+	}
+
+	var step1 struct {
+		APIIndex int `json:"api_index"`
+	}
+	if err := json.Unmarshal([]byte(extractJSON(apiJSON)), &step1); err != nil {
+		return model.APIDoc{}, nil, "", "", fmt.Errorf("parse API index: %w; raw=%s", err, apiJSON)
+	}
+	if step1.APIIndex < 0 || step1.APIIndex >= len(apis) {
+		return model.APIDoc{}, nil, "", "", errors.New("api_index out of range")
+	}
+	chosen := apis[step1.APIIndex]
+		
+	fieldSummaries := make([]string, len(chosen.Fields))
+	for i, f := range chosen.Fields {
+		fieldSummaries[i] = fmt.Sprintf("[%d] %s (%s) - %s", i, f.Name, f.Type, f.Description)
+	}
+
+	fieldsPrompt := fmt.Sprintf(`For the chosen API %q %s:
+
+Fields:
+%s
+
+User request: %q
+
+Return ONLY valid JSON with shape: {"field_index": [<int>, ...]}
+`, chosen.Name, chosen.Path, strings.Join(fieldSummaries, "\n"), user)
+
+	fieldsJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, fieldsPrompt,
+		llms.WithTemperature(0.0))
+	if err != nil {
+		return model.APIDoc{}, nil, "", "", err
+	}
+
+	var step2 Selection
+	if err := json.Unmarshal([]byte(extractJSON(fieldsJSON)), &step2); err != nil {
+		return model.APIDoc{}, nil, "", "", fmt.Errorf("parse field_index: %w; raw=%s", err, fieldsJSON)
+	}
+
+	var picked []model.APIField
+	for _, idx := range step2.FieldIndex {
+		if idx >= 0 && idx < len(chosen.Fields) {
+			picked = append(picked, chosen.Fields[idx])
+		}
+	}
+
+	payloadPrompt := fmt.Sprintf(`
+You are a senior Go developer responsible for generating a precise, valid sample request payload for an API.
+
+### User Instruction
+%q
+
+### API Specification
+The request model is defined in Go as:
+%s
+
+The selected API endpoint is: "%s %s"
+
+---
+
+### RULES TO FOLLOW STRICTLY
+1. **Format Handling**
+   - If the user explicitly requests **XML**, return a valid XML payload using field names as XML tags.
+   - If the user explicitly requests **JSON**, return a valid JSON payload.
+   - If no format is mentioned, default to JSON.
+   - The **data content** (fields, structure, and values) must remain identical between JSON and XML forms.
+     - Only representation (syntax) changes, not content.
+     - For example:
+       - JSON: '{ "context": { "isAsync": true } }'
+       - XML: '<context><isAsync>true</isAsync></context>'
+
+2. **Field population logic**
+   - Only include fields the user explicitly mentions.
+   - Populate only those fields explicitly mentioned by the user that exist *exactly* in the request struct.
+   - If user is mentioning any unrelated or unspecified field then keep that in details field of meta as name and give value as any dummy.
+   - Field names are case-insensitive but must match the struct definition (e.g., "toWalletAddress" is valid; "address" is not unless the struct has that field).
+   - Follow the Go struct hierarchy strictly.
+   - If the user is not mentioning any field then don't populate anything, keep the whole request payload empty everytime
+
+3. **Tokenized Asset Rules**
+   - If user asks to *create*, *lock*, or *burn* an asset:
+     - Populate inside 'payload -> tokenizedAsset'
+     - For example, if user says "create asset with toWalletAddress and fromWalletAddress", then include:
+       "payload": {
+         "tokenizedAsset": [
+           {
+             "meta": {
+               "toWalletAddress": "sampletowalletaddress",
+               "fromWalletAddress": "dummyvalue"
+             }
+           }
+         ]
+       }
+
+4. **Event Payload Rules**
+   - If user asks for *event* payload or mentions "event":
+     - Populate inside 'payload -> event'
+     - For example, if user says "create event payload with id and type", then include:
+       "payload": {
+         "event": [
+           {
+             "id": "dummy",
+             "type": "dummy",
+             "eventType": "dummy"
+           }
+         ]
+       }
+
+5. **Hierarchy Rules**
+   - Respect nesting levels such as context → payload → tokenizedAsset → meta, etc.
+   - Never flatten or skip nesting.
+   - Maintain proper nesting order:
+     
+     {
+       "context": {
+         "requestId": "dummy",
+         "meta": { ... }
+       },
+       "source": [
+         {"id": "..."}
+       ],
+       "destination": [
+         {"id": "..."}
+       ],
+       "payload": {
+         "tokenizedAsset": [
+           {"id": "..."}
+         ]
+       }
+     }
+     
+   - Never move or flatten fields outside their parent objects.
+
+6. **Private vs Public Data**
+   - If the user mentions private data:
+     - Include both 'source' and 'destination' blocks.
+     - Include an "id" field inside each.
+   - If the user mentions public data:
+     - Do **not** include source or destination.
+
+7. **Unknown Fields Handling**
+   - If the user mentions a field that does not exist in the struct (e.g., "address", "key", or "customData"), include it inside:
+     meta.details → as a list of { "name": "<field>", "value": "<dummy_value>" }.
+   - Example:
+     {
+       "meta": {
+         "details": [
+           { "name": "address", "value": "user_provided_value" },
+           { "name": "key", "value": "dummy_key_value" }
+         ]
+       }
+     }
+
+
+8. **If the user provides no field**
+   - Return nothing (no payload at all).
+
+9. **Context Flags**
+   - If user mentions "UMI compliant" → set 'isUMICompliant': true in context'.
+   - If user mentions "async" → set 'isAsync': true 'in context, else false'.
+   - If not mentioned, omit these fields entirely.
+
+---
+
+### OUTPUT
+Generate only the payload (JSON or XML as per user request). Add explanations, notes, or comments and ask questions as well.
+`, user, getRequestModelSnippet(), chosen.Method, chosen.Path)
+
+	payloadResp, err := llms.GenerateFromSinglePrompt(ctx, llm, payloadPrompt,
+		llms.WithTemperature(0.2))
+	if err != nil {
+		return chosen, picked, "", "", err
+	}
+
+	samplePayload := strings.TrimSpace(payloadResp)
+	
+	// Generate event payload if async is true
+	var eventPayload string
+	if queryInfo != nil && queryInfo.IsAsync != nil && *queryInfo.IsAsync && len(queryInfo.EventFields) > 0 {
+		eventPayload, err = generateEventPayload(ctx, llm, queryInfo.EventFields)
+		if err != nil {
+			// Don't fail if event payload generation fails, just log it
+			eventPayload = ""
+		}
+	}
+
+	return chosen, picked, samplePayload, eventPayload, nil
+}
+
+// generateEventPayload generates event payload based on provided event fields
+func generateEventPayload(ctx context.Context, llm llms.Model, eventFields []string) (string, error) {
+	fieldsStr := strings.Join(eventFields, ", ")
+	
+	eventPrompt := fmt.Sprintf(`Generate a JSON payload for an Event struct with the following fields: %s
+
+Event struct definition:
+type Event struct {
+	Id                string "json:\"id,omitempty\" xml:\"id,attr,omitempty\""
+	Type              string "json:\"type,omitempty\" xml:\"type,attr,omitempty\""
+	EventType         string "json:\"eventType,omitempty\" xml:\"eventType,attr,omitempty\""
+	Category          string "json:\"category,omitempty\" xml:\"category,attr,omitempty\""
+	Timestamp         string "json:\"timestamp,omitempty\" xml:\"timestamp,attr,omitempty\""
+	CreationTimestamp string "json:\"creationTimestamp,omitempty\" xml:\"creationTimestamp,attr,omitempty\""
+	Status            string "json:\"status,omitempty\" xml:\"status,attr,omitempty\""
+	Description       string "json:\"description,omitempty\" xml:\"description,attr,omitempty\""
+	Source            string "json:\"source,omitempty\" xml:\"source,attr,omitempty\""
+	Destination       string "json:\"destination,omitempty\" xml:\"destination,attr,omitempty\""
+	Data              string "json:\"data,omitempty\" xml:\"data,attr,omitempty\""
+	Meta              *Meta  "json:\"meta,omitempty\" xml:\"Meta,omitempty\""
+}
+
+Rules:
+- Only include the fields mentioned: %s
+- Use dummy values for the fields
+- Return ONLY valid JSON for the event payload
+- The event should be wrapped in: {"payload": {"event": [<event object>]}}
+
+Return ONLY the JSON payload, no explanations.`, fieldsStr, fieldsStr)
+	
+	response, err := llms.GenerateFromSinglePrompt(ctx, llm, eventPrompt, llms.WithTemperature(0.2))
+	if err != nil {
+		return "", err
+	}
+	
+	return strings.TrimSpace(response), nil
 }
 
 func getRequestModelSnippet() string {
@@ -542,6 +795,7 @@ type QueryInfo struct {
 	IsUMICompliant *bool   // nil = unknown, true/false = known
 	IsPrivate      *bool   // nil = unknown, true = private, false = public
 	FieldNames     []string // empty = no fields provided
+	EventFields    []string // fields for event payload (when async is true)
 }
 
 // ClassifyQuery determines if the user is asking to create something or asking about a field
@@ -671,38 +925,53 @@ func getRecentHistory(history string, n int) string {
 // ExtractQueryInfo extracts the 4 required pieces of information from conversation
 // Only looks at the current creation request context (not previous unrelated requests)
 func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.Model, isNewRequest bool) (*QueryInfo, error) {
-	// If this is a new creation request, only look at current input and very recent context
-	contextToUse := history
+	// If this is a new creation request, completely ignore previous request context
+	// Only look at the current user input
+	contextToUse := ""
 	if isNewRequest {
-		// For new requests, only use the last 2-3 messages (the current request and maybe one previous)
-		contextToUse = getRecentHistory(history, 2)
+		// For new requests, completely ignore history - start fresh
+		contextToUse = ""
 	} else {
-		// For continuation, use recent context (last 4-5 messages)
+		// For continuation of same request, use recent context (last 4-5 messages)
 		contextToUse = getRecentHistory(history, 5)
 	}
 	
-	extractionPrompt := fmt.Sprintf(`Analyze ONLY the current creation request context and extract the following information:
+	// Build context message
+	contextMsg := ""
+	if contextToUse == "" {
+		contextMsg = "Previous conversation context: IGNORE - this is a new request, start fresh."
+	} else {
+		contextMsg = fmt.Sprintf("Recent conversation context: %s\n\nNOTE: Only extract from the CURRENT request, not from previous unrelated requests.", contextToUse)
+	}
+	
+	extractionPrompt := fmt.Sprintf(`Analyze ONLY the current creation request and extract the following information:
 
 Current user query: %q
-Recent conversation context: %s
+%s
 
-IMPORTANT: Only extract information from the CURRENT creation request. Ignore information from previous unrelated requests.
+CRITICAL RULES:
+- If this is a NEW creation request (like "create gold bond" or "burn asset"), ONLY extract information from the current query.
+- IGNORE all information from previous requests in the conversation.
+- Each new creation request must start fresh - do NOT reuse async/UMI/private/public/fields from previous requests.
 
 Extract:
-1. Is it async? (look for "async", "asynchronous", "yes/no" answers in current context)
-2. Is it UMI compliant? (look for "UMI compliant", "UMI", "yes/no" answers in current context)
-3. Is it private or public? (look for "private", "public", "yes/no" answers in current context)
-4. Field names mentioned (any field names like id, value, key, toWalletAddress, etc. in current context)
+1. Is it async? (look for "async", "asynchronous", "yes/no" answers ONLY in current query)
+2. Is it UMI compliant? (look for "UMI compliant", "UMI", "yes/no" answers ONLY in current query)
+3. Is it private or public? (look for "private", "public", "yes/no" answers ONLY in current query)
+4. Field names mentioned for main payload (any field names like id, value, key, toWalletAddress, etc. ONLY in current query)
+5. Event field names mentioned (if async is true, look for event-related fields like id, type, eventType, timestamp, etc. ONLY in current query)
 
 Return ONLY a JSON object:
 {
   "is_async": true/false/null,
   "is_umi_compliant": true/false/null,
   "is_private": true/false/null,
-  "field_names": ["field1", "field2", ...]
+  "field_names": ["field1", "field2", ...],
+  "event_fields": ["eventField1", "eventField2", ...]
 }
 
-Use null if the information is not found or unclear in the CURRENT request context.`, userInput, contextToUse)
+Use null if the information is not found or unclear in the CURRENT query only. Do NOT use information from previous requests.
+For event_fields, only include if is_async is true or if user mentions event fields.`, userInput, contextMsg)
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, extractionPrompt, llms.WithTemperature(0.0))
 	if err != nil {
@@ -715,6 +984,7 @@ Use null if the information is not found or unclear in the CURRENT request conte
 		IsUMICompliant *bool    `json:"is_umi_compliant"`
 		IsPrivate      *bool    `json:"is_private"`
 		FieldNames     []string `json:"field_names"`
+		EventFields    []string `json:"event_fields"`
 	}
 
 	if err := json.Unmarshal([]byte(extractJSON(response)), &result); err != nil {
@@ -781,6 +1051,7 @@ Use null if the information is not found or unclear in the CURRENT request conte
 		IsUMICompliant: result.IsUMICompliant,
 		IsPrivate:      result.IsPrivate,
 		FieldNames:     result.FieldNames,
+		EventFields:    result.EventFields,
 	}
 	
 	// If extraction failed, use fallback
@@ -797,7 +1068,12 @@ Use null if the information is not found or unclear in the CURRENT request conte
 // extractQueryInfoFallback provides fallback extraction logic
 func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 	info := &QueryInfo{}
-	lower := strings.ToLower(userInput + " " + context)
+	// Only use context if it's not empty (for continuation), otherwise only use current input
+	textToAnalyze := userInput
+	if context != "" {
+		textToAnalyze = userInput + " " + context
+	}
+	lower := strings.ToLower(textToAnalyze)
 	
 	// Check for async
 	if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
@@ -846,7 +1122,6 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		"walletAddress", "requestId", "msgId", "name", "type", "event", "eventType"}
 	for _, field := range commonFields {
 		// Check if field is mentioned as a field name, not just in explanation
-		fieldPattern := "\\b" + field + "\\b"
 		if strings.Contains(lower, field) && !strings.Contains(lower, "explain "+field) &&
 			!strings.Contains(lower, "what is "+field) {
 			info.FieldNames = append(info.FieldNames, field)
@@ -872,6 +1147,11 @@ func GenerateFollowUpQuestions(ctx context.Context, info *QueryInfo, llm llms.Mo
 	if len(info.FieldNames) == 0 {
 		missing = append(missing, "Please provide at least one field name for the payload (e.g., id, value, key, toWalletAddress, etc.)")
 	}
+	
+	// If async is true, check if event fields are provided
+	if info.IsAsync != nil && *info.IsAsync && len(info.EventFields) == 0 {
+		missing = append(missing, "Since this is an async request, please provide at least one field name for the event payload (e.g., id, type, eventType, timestamp, etc.)")
+	}
 
 	if len(missing) == 0 {
 		return "", nil
@@ -895,6 +1175,12 @@ Return ONLY the question text, be concise and friendly.`, strings.Join(missing, 
 func AnswerFieldQuestion(ctx context.Context, userInput, history string, llm llms.Model) (string, error) {
 	// Check if user is asking about UMI specifically
 	lower := strings.ToLower(userInput)
+	
+	// Check for "UMI compliant" vs just "UMI"
+	if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") {
+		return "UMI compliant means that a request adheres to the **Unified Market Interface** (UMI) compliance standard. UMI is a standard that ensures interoperability and standardization across different market participants and systems. When a request is UMI compliant, it means it follows the Unified Market Interface specifications for data exchange and communication protocols.", nil
+	}
+	
 	if strings.Contains(lower, "umi") && (strings.Contains(lower, "explain") || 
 		strings.Contains(lower, "what is") || strings.Contains(lower, "what does") ||
 		strings.Contains(lower, "meaning") || strings.Contains(lower, "stand for") ||
@@ -902,16 +1188,28 @@ func AnswerFieldQuestion(ctx context.Context, userInput, history string, llm llm
 		return "UMI stands for **Unified Market Interface**. It's a compliance standard that ensures interoperability and standardization across different market participants and systems. When a request is UMI compliant, it means it adheres to the Unified Market Interface specifications for data exchange and communication protocols.", nil
 	}
 	
+	// Check for async field question
+	if strings.Contains(lower, "async") && (strings.Contains(lower, "what is") || 
+		strings.Contains(lower, "explain") || strings.Contains(lower, "what does") ||
+		strings.Contains(lower, "field")) {
+		return "The **async** field (or **isAsync**) is a boolean flag in the request context that indicates whether the API request should be processed asynchronously. When set to `true`, the request is processed asynchronously, meaning the API will return immediately and process the request in the background. When set to `false` or omitted, the request is processed synchronously, meaning the API will wait for the operation to complete before returning a response.", nil
+	}
+	
+	// Don't use history for field questions - answer based on current question only
+	// This prevents confusion from previous questions
 	answerPrompt := fmt.Sprintf(`You are a helpful API documentation assistant. The user is asking about a field or property.
 
 User question: %q
-Conversation history: %s
 
-IMPORTANT: If the user asks about "UMI", always mention that it stands for "Unified Market Interface" and explain it's a compliance standard.
+IMPORTANT RULES:
+- If the user asks about "UMI" or "UMI compliant", explain that UMI stands for "Unified Market Interface" and it's a compliance standard.
+- If the user asks about "async" or "isAsync", explain it's a boolean flag for asynchronous processing.
+- Answer ONLY the current question. Do NOT reference previous questions or answers.
+- Answer the question clearly and concisely.
+- Do NOT suggest any APIs or generate payloads.
+- Just explain what the field is, what it does, or answer their question directly.
 
-Answer the question clearly and concisely. Do NOT suggest any APIs or generate payloads. Just explain what the field is, what it does, or answer their question directly.
-
-If you don't know the answer, say so politely.`, userInput, history)
+If you don't know the answer, say so politely.`, userInput)
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, answerPrompt, llms.WithTemperature(0.3))
 	if err != nil {

@@ -120,9 +120,9 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 		response = "I'm an API recommender assistant. I can help you with API-related requests like creating assets, bonds, transactions, or answering questions about API fields. Your request doesn't seem to be related to APIs. How can I help you with API-related tasks?"
 	} else if !isCreationRequest {
 		// User is asking about a field - answer without suggesting APIs
-		// Use only recent history to avoid confusion
-		recentHistory := getRecentHistoryForContext(history, 3)
-		response, err = recommend.AnswerFieldQuestion(ctx, userInput, recentHistory, s.model)
+		// Don't use history for field questions - they should be answered based on current question only
+		// This prevents lagging behind previous questions
+		response, err = recommend.AnswerFieldQuestion(ctx, userInput, "", s.model)
 		if err != nil {
 			return "", trimmedSession, fmt.Errorf("answer field question: %w", err)
 		}
@@ -140,11 +140,16 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 			return "", trimmedSession, fmt.Errorf("extract query info: %w", err)
 		}
 
-		// Check if all 4 required pieces of information are present
+		// Check if all required pieces of information are present
 		hasAllInfo := queryInfo.IsAsync != nil &&
 			queryInfo.IsUMICompliant != nil &&
 			queryInfo.IsPrivate != nil &&
 			len(queryInfo.FieldNames) > 0
+		
+		// If async is true, also need event fields
+		if queryInfo.IsAsync != nil && *queryInfo.IsAsync {
+			hasAllInfo = hasAllInfo && len(queryInfo.EventFields) > 0
+		}
 
 		if !hasAllInfo {
 			// Generate follow-up questions for missing information
@@ -157,11 +162,11 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 			// All information is present - proceed with API recommendation
 			// Use recent history for context
 			prompt := composeConversationAwareRequest(recentHistory, userInput)
-			api, fields, samplePayload, err := recommend.Recommend1(ctx, s.apis, prompt)
+			api, fields, samplePayload, eventPayload, err := recommend.Recommend1(ctx, s.apis, prompt, queryInfo)
 			if err != nil {
 				return "", trimmedSession, err
 			}
-			response = formatRecommendation(api, fields, samplePayload)
+			response = formatRecommendation(api, fields, samplePayload, eventPayload)
 		}
 	}
 
@@ -340,7 +345,15 @@ func isNewCreationRequest(userInput, history string) bool {
 	for _, keyword := range creationKeywords {
 		if strings.Contains(lower, keyword) {
 			// Check if it's not just answering a question
-			if !strings.Contains(lower, "yes") && !strings.Contains(lower, "no") {
+			// If it contains creation keywords and is not just "yes"/"no", it's a new request
+			isJustAnswer := strings.Contains(lower, "yes") || strings.Contains(lower, "no")
+			// Also check if it's a full sentence with creation intent
+			hasCreationIntent := strings.Contains(lower, keyword) && 
+				(strings.Contains(lower, "asset") || strings.Contains(lower, "bond") || 
+				 strings.Contains(lower, "transaction") || strings.Contains(lower, "gold") ||
+				 strings.Contains(lower, "token"))
+			
+			if hasCreationIntent || (!isJustAnswer && len(strings.Fields(lower)) > 2) {
 				return true
 			}
 		}
@@ -354,7 +367,7 @@ func isNewCreationRequest(userInput, history string) bool {
 	return false
 }
 
-func formatRecommendation(api apiparser.APIDoc, fields []apiparser.APIField, samplePayload string) string {
+func formatRecommendation(api apiparser.APIDoc, fields []apiparser.APIField, samplePayload, eventPayload string) string {
 	var builder strings.Builder
 	builder.WriteString("Recommended API:\n")
 	builder.WriteString(fmt.Sprintf(" Name: %s\n Path: %s\n Method: %s\n Description: %s\n", api.Name, api.Path, api.Method, api.Description))
@@ -374,6 +387,15 @@ func formatRecommendation(api apiparser.APIDoc, fields []apiparser.APIField, sam
 		builder.WriteString("Sample payload:\n")
 		builder.WriteString(samplePayload)
 		if !strings.HasSuffix(samplePayload, "\n") {
+			builder.WriteString("\n")
+		}
+	}
+	
+	eventPayload = strings.TrimSpace(eventPayload)
+	if eventPayload != "" {
+		builder.WriteString("\nEvent payload (for async requests):\n")
+		builder.WriteString(eventPayload)
+		if !strings.HasSuffix(eventPayload, "\n") {
 			builder.WriteString("\n")
 		}
 	}
