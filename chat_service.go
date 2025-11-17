@@ -131,10 +131,18 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 		// A new request typically starts with creation keywords
 		isNewRequest := isNewCreationRequest(userInput, history)
 		
-		// Use recent history only to avoid mixing with previous requests
-		recentHistory := getRecentHistoryForContext(history, 5)
+		// For continuation (answering questions), use more history to capture previous Q&A
+		// For new requests, use less history
+		var recentHistory string
+		if isNewRequest {
+			// New request - minimal history
+			recentHistory = getRecentHistoryForContext(history, 2)
+		} else {
+			// Continuation - use more history to capture the questions and answers
+			recentHistory = getRecentHistoryForContext(history, 10)
+		}
 		
-		// Extract query info - only from current request context
+		// Extract query info - from current request context
 		queryInfo, err := recommend.ExtractQueryInfo(ctx, userInput, recentHistory, s.model, isNewRequest)
 		if err != nil {
 			return "", trimmedSession, fmt.Errorf("extract query info: %w", err)

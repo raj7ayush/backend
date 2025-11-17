@@ -17,227 +17,6 @@ type Selection struct {
 	FieldIndex []int `json:"field_index"`
 }
 
-func Recommend(ctx context.Context, apis []model.APIDoc, user string) (model.APIDoc, []model.APIField, string, error) {
-	llm, err := llm.NewGroqLLM()
-	if err != nil {
-		return model.APIDoc{}, nil, "", "", err
-	}
-
-	apiSummaries := make([]string, len(apis))
-	for i, a := range apis {
-		apiSummaries[i] = fmt.Sprintf("[%d] %s %s - %s", i, a.Method, a.Path, a.Description)
-	}
-
-	pickPrompt := fmt.Sprintf(`You are selecting the best API for the user's request.
-
-APIs:
-%s
-
-User request: %q
-
-Return ONLY valid JSON with shape: {"api_index": <int>}
-`, strings.Join(apiSummaries, "\n"), user)
-
-	apiJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, pickPrompt,
-		llms.WithTemperature(0.0))
-	if err != nil {
-		return model.APIDoc{}, nil, "", "", err
-	}
-
-	var step1 struct {
-		APIIndex int `json:"api_index"`
-	}
-	if err := json.Unmarshal([]byte(extractJSON(apiJSON)), &step1); err != nil {
-		return model.APIDoc{}, nil, "", "", fmt.Errorf("parse API index: %w; raw=%s", err, apiJSON)
-	}
-	if step1.APIIndex < 0 || step1.APIIndex >= len(apis) {
-		return model.APIDoc{}, nil, "", "", errors.New("api_index out of range")
-	}
-	chosen := apis[step1.APIIndex]
-		
-	fieldSummaries := make([]string, len(chosen.Fields))
-	for i, f := range chosen.Fields {
-		fieldSummaries[i] = fmt.Sprintf("[%d] %s (%s) - %s", i, f.Name, f.Type, f.Description)
-	}
-
-	fieldsPrompt := fmt.Sprintf(`For the chosen API %q %s:
-
-Fields:
-%s
-
-User request: %q
-
-Return ONLY valid JSON with shape: {"field_index": [<int>, ...]}
-`, chosen.Name, chosen.Path, strings.Join(fieldSummaries, "\n"), user)
-
-	fieldsJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, fieldsPrompt,
-		llms.WithTemperature(0.0))
-	if err != nil {
-		return model.APIDoc{}, nil, "", "", err
-	}
-
-	var step2 Selection
-	if err := json.Unmarshal([]byte(extractJSON(fieldsJSON)), &step2); err != nil {
-		return model.APIDoc{}, nil, "", "", fmt.Errorf("parse field_index: %w; raw=%s", err, fieldsJSON)
-	}
-
-	var picked []model.APIField
-	for _, idx := range step2.FieldIndex {
-		if idx >= 0 && idx < len(chosen.Fields) {
-			picked = append(picked, chosen.Fields[idx])
-		}
-	}
-
-	payloadPrompt := fmt.Sprintf(`
-You are a senior Go developer responsible for generating a precise, valid sample request payload for an API.
-
-### User Instruction
-%q
-
-### API Specification
-The request model is defined in Go as:
-%s
-
-The selected API endpoint is: "%s %s"
-
----
-
-### RULES TO FOLLOW STRICTLY
-1. **Format Handling**
-   - If the user explicitly requests **XML**, return a valid XML payload using field names as XML tags.
-   - If the user explicitly requests **JSON**, return a valid JSON payload.
-   - If no format is mentioned, default to JSON.
-   - The **data content** (fields, structure, and values) must remain identical between JSON and XML forms.
-     - Only representation (syntax) changes, not content.
-     - For example:
-       - JSON: '{ "context": { "isAsync": true } }'
-       - XML: '<context><isAsync>true</isAsync></context>'
-
-2. **Field population logic**
-   - Only include fields the user explicitly mentions.
-   - Populate only those fields explicitly mentioned by the user that exist *exactly* in the request struct.
-   - If user is mentioning any unrelated or unspecified field then keep that in details field of meta as name and give value as any dummy.
-   - Field names are case-insensitive but must match the struct definition (e.g., "toWalletAddress" is valid; "address" is not unless the struct has that field).
-   - Follow the Go struct hierarchy strictly.
-   - If the user is not mentioning any field then don't populate anything, keep the whole request payload empty everytime
-
-3. **Tokenized Asset Rules**
-   - If user asks to *create*, *lock*, or *burn* an asset:
-     - Populate inside 'payload -> tokenizedAsset'
-     - For example, if user says "create asset with toWalletAddress and fromWalletAddress", then include:
-       "payload": {
-         "tokenizedAsset": [
-           {
-             "meta": {
-               "toWalletAddress": "sampletowalletaddress",
-               "fromWalletAddress": "dummyvalue"
-             }
-           }
-         ]
-       }
-
-4. **Event Payload Rules**
-   - If user asks for *event* payload or mentions "event":
-     - Populate inside 'payload -> event'
-     - For example, if user says "create event payload with id and type", then include:
-       "payload": {
-         "event": [
-           {
-             "id": "dummy",
-             "type": "dummy",
-             "eventType": "dummy"
-           }
-         ]
-       }
-
-5. **Hierarchy Rules**
-   - Respect nesting levels such as context → payload → tokenizedAsset → meta, etc.
-   - Never flatten or skip nesting.
-   - Maintain proper nesting order:
-     
-     {
-       "context": {
-         "requestId": "dummy",
-         "meta": { ... }
-       },
-       "source": [
-         {"id": "..."}
-       ],
-       "destination": [
-         {"id": "..."}
-       ],
-       "payload": {
-         "tokenizedAsset": [
-           {"id": "..."}
-         ]
-       }
-     }
-     
-   - Never move or flatten fields outside their parent objects.
-
-6. **Private vs Public Data**
-   - If the user mentions private data:
-     - Include both 'source' and 'destination' blocks.
-     - Include an "id" field inside each.
-   - If the user mentions public data:
-     - Do **not** include source or destination.
-
-7. **Unknown Fields Handling**
-   - If the user mentions a field that does not exist in the struct (e.g., "address", "key", or "customData"), include it inside:
-     meta.details → as a list of { "name": "<field>", "value": "<dummy_value>" }.
-   - Example:
-     {
-       "meta": {
-         "details": [
-           { "name": "address", "value": "user_provided_value" },
-           { "name": "key", "value": "dummy_key_value" }
-         ]
-       }
-     }
-
-
-8. **If the user provides no field**
-   - Return nothing (no payload at all).
-
-9. **Context Flags**
-   - If user mentions “UMI compliant” → set 'isUMICompliant': true in context'.
-   - If user mentions “async” → set 'isAsync': true 'in context, else false'.
-   - If not mentioned, omit these fields entirely.
-
-10. **Follow-up Questions (for Interactivity)**
-   - If user query is vague (e.g., “I want to create asset”), respond with brief clarification questions such as:
-     - “Would you like it to be UMI compliant?”
-     - “Should this be created in async mode?”
-     - “Please provide a few field names to include in the payload.”
-   - Wait for user’s response before generating final payload.
-
-11. **Minimum Required Information (New Rule)**
-   - Do **not** generate or recommend any payload or API until the user has clearly provided the following four details:
-     1. Whether it should be **UMI compliant** (yes/no)
-     2. Whether it should be **async** (yes/no)
-     3. Whether the data is **private or public**
-     4. At least one **field name** (like id, value, key, or any valid struct field)
-   - Keep asking these as follow-up questions until all four are answered.
-   - Once all four are provided, then — and only then — generate the payload and recommend the suitable API.
-
-
----
-
-### OUTPUT
-Generate only the payload (JSON or XML as per user request). Add explanations, notes, or comments and ask questions as well.
-`, user, getRequestModelSnippet(), chosen.Method, chosen.Path)
-
-	payloadResp, err := llms.GenerateFromSinglePrompt(ctx, llm, payloadPrompt,
-		llms.WithTemperature(0.2))
-	if err != nil {
-		return chosen, picked, "", "", err
-	}
-
-	samplePayload := strings.TrimSpace(payloadResp)
-
-	return chosen, picked, samplePayload, "", nil
-}
-
 // Recommend1 is the updated version that supports event payloads for async requests
 func Recommend1(ctx context.Context, apis []model.APIDoc, user string, queryInfo *QueryInfo) (model.APIDoc, []model.APIField, string, string, error) {
 	llm, err := llm.NewGroqLLM()
@@ -927,13 +706,14 @@ func getRecentHistory(history string, n int) string {
 func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.Model, isNewRequest bool) (*QueryInfo, error) {
 	// If this is a new creation request, completely ignore previous request context
 	// Only look at the current user input
-	contextToUse := ""
+	var contextToUse string
 	if isNewRequest {
 		// For new requests, completely ignore history - start fresh
 		contextToUse = ""
 	} else {
-		// For continuation of same request, use recent context (last 4-5 messages)
-		contextToUse = getRecentHistory(history, 5)
+		// For continuation of same request, use the provided history (which should include Q&A)
+		// This is important to capture answers to previous questions
+		contextToUse = history
 	}
 	
 	// Build context message
@@ -941,25 +721,40 @@ func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.M
 	if contextToUse == "" {
 		contextMsg = "Previous conversation context: IGNORE - this is a new request, start fresh."
 	} else {
-		contextMsg = fmt.Sprintf("Recent conversation context: %s\n\nNOTE: Only extract from the CURRENT request, not from previous unrelated requests.", contextToUse)
+		contextMsg = fmt.Sprintf(`Recent conversation context (this is a CONTINUATION - user is answering questions):
+%s
+
+IMPORTANT: Look for question-answer pairs. For example:
+- If you see "Is this async?" followed by "yes" or "no" → extract that answer
+- If you see "Is this UMI compliant?" followed by "yes" or "no" → extract that answer  
+- If you see "Is this private or public?" followed by "private" or "public" → extract that answer
+- If you see field names mentioned → extract them
+
+Extract information from BOTH the current query AND the conversation context above.`, contextToUse)
 	}
 	
-	extractionPrompt := fmt.Sprintf(`Analyze ONLY the current creation request and extract the following information:
+	extractionPrompt := fmt.Sprintf(`Analyze the current creation request and extract the following information:
 
 Current user query: %q
 %s
 
 CRITICAL RULES:
 - If this is a NEW creation request (like "create gold bond" or "burn asset"), ONLY extract information from the current query.
-- IGNORE all information from previous requests in the conversation.
-- Each new creation request must start fresh - do NOT reuse async/UMI/private/public/fields from previous requests.
+- If this is a CONTINUATION (user answering questions), extract from BOTH current query AND the conversation context above.
+- Look for question-answer patterns in the conversation:
+  * "Is this async?" → look for "yes"/"no" answer → set is_async accordingly
+  * "Is this UMI compliant?" → look for "yes"/"no" answer → set is_umi_compliant accordingly
+  * "Is this private or public?" → look for "private"/"public" answer → set is_private accordingly
+  * Field names mentioned anywhere in the conversation → add to field_names
+- IGNORE all information from PREVIOUS UNRELATED requests (different creation requests).
+- But DO use information from the CURRENT request's question-answer flow.
 
 Extract:
-1. Is it async? (look for "async", "asynchronous", "yes/no" answers ONLY in current query)
-2. Is it UMI compliant? (look for "UMI compliant", "UMI", "yes/no" answers ONLY in current query)
-3. Is it private or public? (look for "private", "public", "yes/no" answers ONLY in current query)
-4. Field names mentioned for main payload (any field names like id, value, key, toWalletAddress, etc. ONLY in current query)
-5. Event field names mentioned (if async is true, look for event-related fields like id, type, eventType, timestamp, etc. ONLY in current query)
+1. Is it async? (look for "async", "asynchronous", or "yes"/"no" answers to async questions in current query AND conversation context)
+2. Is it UMI compliant? (look for "UMI compliant", "UMI", or "yes"/"no" answers to UMI questions in current query AND conversation context)
+3. Is it private or public? (look for "private", "public", or answers to private/public questions in current query AND conversation context)
+4. Field names mentioned for main payload (any field names like id, value, key, toWalletAddress, etc. in current query AND conversation context)
+5. Event field names mentioned (if async is true, look for event-related fields like id, type, eventType, timestamp, etc. in current query AND conversation context)
 
 Return ONLY a JSON object:
 {
@@ -970,8 +765,10 @@ Return ONLY a JSON object:
   "event_fields": ["eventField1", "eventField2", ...]
 }
 
-Use null if the information is not found or unclear in the CURRENT query only. Do NOT use information from previous requests.
-For event_fields, only include if is_async is true or if user mentions event fields.`, userInput, contextMsg)
+IMPORTANT: 
+- If this is a continuation, extract from BOTH current query AND conversation context.
+- Use null ONLY if the information is truly not found in the current request's conversation flow.
+- For event_fields, only include if is_async is true or if user mentions event fields.`, userInput, contextMsg)
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, extractionPrompt, llms.WithTemperature(0.0))
 	if err != nil {
@@ -988,62 +785,8 @@ For event_fields, only include if is_async is true or if user mentions event fie
 	}
 
 	if err := json.Unmarshal([]byte(extractJSON(response)), &result); err != nil {
-		// Fallback: simple keyword matching
-		info := &QueryInfo{}
-		lower := strings.ToLower(userInput + " " + history)
-		
-		// Check for async (handle both yes and no)
-		if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
-			// Check for negative indicators
-			asyncFalse := strings.Contains(lower, "not async") || 
-				strings.Contains(lower, "no async") || 
-				strings.Contains(lower, "async: no") ||
-				strings.Contains(lower, "async=false")
-			if asyncFalse {
-				asyncFalseVal := false
-				info.IsAsync = &asyncFalseVal
-			} else {
-				asyncTrue := true
-				info.IsAsync = &asyncTrue
-			}
-		}
-		
-		// Check for UMI compliant (handle both yes and no)
-		if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") || strings.Contains(lower, "umi") {
-			// Check for negative indicators
-			umiFalse := strings.Contains(lower, "not umi") || 
-				strings.Contains(lower, "no umi") || 
-				strings.Contains(lower, "umi: no") ||
-				strings.Contains(lower, "umi=false")
-			if umiFalse {
-				umiFalseVal := false
-				info.IsUMICompliant = &umiFalseVal
-			} else {
-				umiTrue := true
-				info.IsUMICompliant = &umiTrue
-			}
-		}
-		
-		// Check for private/public
-		if strings.Contains(lower, "private") && !strings.Contains(lower, "public") {
-			privateTrue := true
-			info.IsPrivate = &privateTrue
-		} else if strings.Contains(lower, "public") {
-			privateFalse := false
-			info.IsPrivate = &privateFalse
-		}
-		
-		// Try to extract field names from common patterns
-		// This is a simple heuristic - the LLM-based extraction is preferred
-		commonFields := []string{"id", "value", "key", "toWalletAddress", "fromWalletAddress", 
-			"walletAddress", "requestId", "msgId", "name", "type"}
-		for _, field := range commonFields {
-			if strings.Contains(lower, field) {
-				info.FieldNames = append(info.FieldNames, field)
-			}
-		}
-		
-		return info, nil
+		// Fallback: use the fallback function with proper context
+		return extractQueryInfoFallback(userInput, contextToUse), nil
 	}
 
 	info := &QueryInfo{
@@ -1068,43 +811,74 @@ For event_fields, only include if is_async is true or if user mentions event fie
 // extractQueryInfoFallback provides fallback extraction logic
 func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 	info := &QueryInfo{}
-	// Only use context if it's not empty (for continuation), otherwise only use current input
+	// Always use context if available to capture previous answers
+	// Put context first so previous answers are found
 	textToAnalyze := userInput
 	if context != "" {
-		textToAnalyze = userInput + " " + context
+		textToAnalyze = context + " " + userInput
 	}
 	lower := strings.ToLower(textToAnalyze)
 	
-	// Check for async
+	// Check for async - look for explicit mentions or yes/no answers to async questions
 	if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
+		// Check for negative indicators
 		asyncFalse := strings.Contains(lower, "not async") || 
 			strings.Contains(lower, "no async") || 
 			strings.Contains(lower, "async: no") ||
 			strings.Contains(lower, "async=false") ||
-			strings.Contains(lower, "async no")
+			strings.Contains(lower, "async no") ||
+			(strings.Contains(lower, "async") && strings.Contains(lower, "no") && 
+			 strings.Index(lower, "async") < strings.Index(lower, "no")+10)
 		if asyncFalse {
 			asyncFalseVal := false
 			info.IsAsync = &asyncFalseVal
 		} else {
+			// Check if there's a "yes" answer near "async" question
 			asyncTrue := true
 			info.IsAsync = &asyncTrue
 		}
+	} else if context != "" {
+		// Look for yes/no answers to async questions in context
+		// Pattern: question about async followed by yes/no
+		if (strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous")) &&
+			(strings.Contains(lower, " yes") || strings.Contains(lower, "\nyes") || 
+			 strings.Contains(lower, "yes\n") || strings.Contains(lower, "yes,")) {
+			asyncTrue := true
+			info.IsAsync = &asyncTrue
+		} else if (strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous")) &&
+			(strings.Contains(lower, " no") || strings.Contains(lower, "\nno") || 
+			 strings.Contains(lower, "no\n") || strings.Contains(lower, "no,")) {
+			asyncFalseVal := false
+			info.IsAsync = &asyncFalseVal
+		}
 	}
 	
-	// Check for UMI compliant
-	if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") || 
-		(strings.Contains(lower, "umi") && !strings.Contains(lower, "explain")) {
+	// Check for UMI compliant - look for explicit mentions or yes/no answers
+	if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") {
 		umiFalse := strings.Contains(lower, "not umi") || 
 			strings.Contains(lower, "no umi") || 
 			strings.Contains(lower, "umi: no") ||
 			strings.Contains(lower, "umi=false") ||
-			strings.Contains(lower, "umi no")
+			strings.Contains(lower, "umi no") ||
+			(strings.Contains(lower, "umi") && strings.Contains(lower, "no") && 
+			 strings.Index(lower, "umi") < strings.Index(lower, "no")+15)
 		if umiFalse {
 			umiFalseVal := false
 			info.IsUMICompliant = &umiFalseVal
 		} else {
 			umiTrue := true
 			info.IsUMICompliant = &umiTrue
+		}
+	} else if strings.Contains(lower, "umi") && !strings.Contains(lower, "explain") {
+		// Check for yes/no answers to UMI questions
+		if strings.Contains(lower, " yes") || strings.Contains(lower, "\nyes") || 
+			strings.Contains(lower, "yes\n") || strings.Contains(lower, "yes,") {
+			umiTrue := true
+			info.IsUMICompliant = &umiTrue
+		} else if strings.Contains(lower, " no") || strings.Contains(lower, "\nno") || 
+			strings.Contains(lower, "no\n") || strings.Contains(lower, "no,") {
+			umiFalseVal := false
+			info.IsUMICompliant = &umiFalseVal
 		}
 	}
 	
