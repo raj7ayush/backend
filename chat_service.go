@@ -105,24 +105,37 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 		}
 	}
 
-	// Classify the query: is it a creation request or a field question?
-	isCreationRequest, err := recommend.ClassifyQuery(ctx, userInput, history, s.model)
+	// Classify the query: is it a creation request or a field question? Is it relevant?
+	isCreationRequest, isRelevant, err := recommend.ClassifyQuery(ctx, userInput, history, s.model)
 	if err != nil {
 		// If classification fails, default to creation request to maintain backward compatibility
 		isCreationRequest = true
+		isRelevant = true
 	}
 
 	var response string
 
-	if !isCreationRequest {
+	// Handle irrelevant requests
+	if !isRelevant {
+		response = "I'm an API recommender assistant. I can help you with API-related requests like creating assets, bonds, transactions, or answering questions about API fields. Your request doesn't seem to be related to APIs. How can I help you with API-related tasks?"
+	} else if !isCreationRequest {
 		// User is asking about a field - answer without suggesting APIs
-		response, err = recommend.AnswerFieldQuestion(ctx, userInput, history, s.model)
+		// Use only recent history to avoid confusion
+		recentHistory := getRecentHistoryForContext(history, 3)
+		response, err = recommend.AnswerFieldQuestion(ctx, userInput, recentHistory, s.model)
 		if err != nil {
 			return "", trimmedSession, fmt.Errorf("answer field question: %w", err)
 		}
 	} else {
-		// User wants to create something - check if we have all required information
-		queryInfo, err := recommend.ExtractQueryInfo(ctx, userInput, history, s.model)
+		// User wants to create something - detect if this is a new request
+		// A new request typically starts with creation keywords
+		isNewRequest := isNewCreationRequest(userInput, history)
+		
+		// Use recent history only to avoid mixing with previous requests
+		recentHistory := getRecentHistoryForContext(history, 5)
+		
+		// Extract query info - only from current request context
+		queryInfo, err := recommend.ExtractQueryInfo(ctx, userInput, recentHistory, s.model, isNewRequest)
 		if err != nil {
 			return "", trimmedSession, fmt.Errorf("extract query info: %w", err)
 		}
@@ -142,7 +155,8 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 			response = questions
 		} else {
 			// All information is present - proceed with API recommendation
-			prompt := composeConversationAwareRequest(history, userInput)
+			// Use recent history for context
+			prompt := composeConversationAwareRequest(recentHistory, userInput)
 			api, fields, samplePayload, err := recommend.Recommend1(ctx, s.apis, prompt)
 			if err != nil {
 				return "", trimmedSession, err
@@ -294,6 +308,50 @@ func composeConversationAwareRequest(history, latest string) string {
 		return latest
 	}
 	return fmt.Sprintf("Conversation so far:\n%s\n\nLatest user request: %s", history, latest)
+}
+
+// getRecentHistoryForContext extracts only the last N messages from history for context
+func getRecentHistoryForContext(history string, n int) string {
+	if history == "" {
+		return ""
+	}
+	
+	// Split by message pairs (Human/AI)
+	parts := strings.Split(history, "\n\n")
+	if len(parts) <= n {
+		return history
+	}
+	
+	// Get last N parts
+	start := len(parts) - n
+	if start < 0 {
+		start = 0
+	}
+	
+	return strings.Join(parts[start:], "\n\n")
+}
+
+// isNewCreationRequest detects if this is a new creation request (not a continuation)
+func isNewCreationRequest(userInput, history string) bool {
+	lower := strings.ToLower(userInput)
+	
+	// Check for creation keywords that indicate a new request
+	creationKeywords := []string{"create", "make", "generate", "build", "new", "want to", "need to", "burn", "lock"}
+	for _, keyword := range creationKeywords {
+		if strings.Contains(lower, keyword) {
+			// Check if it's not just answering a question
+			if !strings.Contains(lower, "yes") && !strings.Contains(lower, "no") {
+				return true
+			}
+		}
+	}
+	
+	// If it's a short answer (yes/no/field names), it's likely a continuation
+	if len(strings.Fields(lower)) <= 3 {
+		return false
+	}
+	
+	return false
 }
 
 func formatRecommendation(api apiparser.APIDoc, fields []apiparser.APIField, samplePayload string) string {
