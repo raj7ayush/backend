@@ -117,7 +117,7 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 
 	// Handle irrelevant requests
 	if !isRelevant {
-		response = "I'm an API recommender assistant. I can help you with API-related requests like creating assets, bonds, transactions, or answering questions about API fields. Your request doesn't seem to be related to APIs. How can I help you with API-related tasks?"
+		response = "I'm an AI agent for the UMI (Unified Market Interface) project. I can help you with UMI project-related requests like creating assets, bonds, transactions, or answering questions about API fields and project-specific concepts. Your request doesn't seem to be related to the UMI project. How can I help you with UMI-related tasks?"
 	} else if !isCreationRequest {
 		// User is asking about a field - answer without suggesting APIs
 		// Don't use history for field questions - they should be answered based on current question only
@@ -153,6 +153,11 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 			queryInfo.IsUMICompliant != nil &&
 			queryInfo.IsPrivate != nil &&
 			len(queryInfo.FieldNames) > 0
+		
+		// If usecase is mentioned, operation must be specified
+		if queryInfo.UseCase != "" && queryInfo.Operation == "" {
+			hasAllInfo = false
+		}
 		
 		// If async is true, also need event fields
 		if queryInfo.IsAsync != nil && *queryInfo.IsAsync {

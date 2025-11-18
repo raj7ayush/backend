@@ -29,15 +29,39 @@ func Recommend1(ctx context.Context, apis []model.APIDoc, user string, queryInfo
 		apiSummaries[i] = fmt.Sprintf("[%d] %s %s - %s", i, a.Method, a.Path, a.Description)
 	}
 
-	pickPrompt := fmt.Sprintf(`You are selecting the best API for the user's request.
+	// Build enhanced user request with usecase and operation context
+	enhancedUserRequest := user
+	if queryInfo != nil {
+		if queryInfo.UseCase != "" {
+			enhancedUserRequest = fmt.Sprintf("%s (usecase: %s)", user, queryInfo.UseCase)
+		}
+		if queryInfo.Operation != "" {
+			operationMap := map[string]string{
+				"create": "req issue",
+				"burn": "req manage",
+				"trade": "req settle",
+			}
+			if apiType, ok := operationMap[queryInfo.Operation]; ok {
+				enhancedUserRequest = fmt.Sprintf("%s (operation: %s, API type: %s)", enhancedUserRequest, queryInfo.Operation, apiType)
+			}
+		}
+	}
+	
+	pickPrompt := fmt.Sprintf(`You are selecting the best API for the user's request in the UMI project.
 
 APIs:
 %s
 
 User request: %q
 
+IMPORTANT: 
+- If user mentions "create" or "issue" operation → look for APIs with "req issue" or "issue" in name/path
+- If user mentions "burn" or "manage" operation → look for APIs with "req manage" or "manage" in name/path
+- If user mentions "trade" or "settle" operation → look for APIs with "req settle" or "settle" in name/path
+- If usecase is mentioned (insurance, fd, gold bond, etc.), consider APIs relevant to that usecase
+
 Return ONLY valid JSON with shape: {"api_index": <int>}
-`, strings.Join(apiSummaries, "\n"), user)
+`, strings.Join(apiSummaries, "\n"), enhancedUserRequest)
 
 	apiJSON, err := llms.GenerateFromSinglePrompt(ctx, llm, pickPrompt,
 		llms.WithTemperature(0.0))
@@ -89,11 +113,33 @@ Return ONLY valid JSON with shape: {"field_index": [<int>, ...]}
 		}
 	}
 
+	// Build field list for request payload (exclude event fields)
+	requestFieldsList := ""
+	if queryInfo != nil && len(queryInfo.FieldNames) > 0 {
+		// If usecase is specified, mention it in the prompt
+		usecaseContext := ""
+		if queryInfo.UseCase != "" {
+			usecaseContext = fmt.Sprintf(" (for %s usecase", queryInfo.UseCase)
+			if queryInfo.Operation != "" {
+				usecaseContext += fmt.Sprintf(" - %s operation", queryInfo.Operation)
+			}
+			usecaseContext += ")"
+		}
+		requestFieldsList = fmt.Sprintf("\n\n### CRITICAL: Fields for REQUEST PAYLOAD ONLY%s\nUse ONLY these fields in the request payload: %s\nDO NOT include any event-related fields (id, type, eventType, timestamp, etc.) in the request payload.\nEvent fields will be handled separately in the event payload.", usecaseContext, strings.Join(queryInfo.FieldNames, ", "))
+	}
+	
+	// Warn if event fields are present (they should not be in request payload)
+	eventFieldsWarning := ""
+	if queryInfo != nil && len(queryInfo.EventFields) > 0 {
+		eventFieldsWarning = fmt.Sprintf("\n\n### CRITICAL: DO NOT INCLUDE EVENT FIELDS IN REQUEST PAYLOAD\nThe following fields are for EVENT payload ONLY (not request payload): %s\nThese fields should NOT appear in the request payload you generate.", strings.Join(queryInfo.EventFields, ", "))
+	}
+	
 	payloadPrompt := fmt.Sprintf(`
 You are a senior Go developer responsible for generating a precise, valid sample request payload for an API.
 
 ### User Instruction
 %q
+%s%s
 
 ### API Specification
 The request model is defined in Go as:
@@ -114,9 +160,10 @@ The selected API endpoint is: "%s %s"
        - JSON: '{ "context": { "isAsync": true } }'
        - XML: '<context><isAsync>true</isAsync></context>'
 
-2. **Field population logic**
-   - Only include fields the user explicitly mentions.
-   - Populate only those fields explicitly mentioned by the user that exist *exactly* in the request struct.
+2. **Field population logic - REQUEST PAYLOAD ONLY**
+   - ONLY include fields that were explicitly mentioned for the REQUEST payload (not event payload).
+   - Populate only those fields explicitly mentioned by the user for the REQUEST payload that exist *exactly* in the request struct.
+   - DO NOT include any event-related fields (id, type, eventType, timestamp, etc.) in the request payload.
    - If user is mentioning any unrelated or unspecified field then keep that in details field of meta as name and give value as any dummy.
    - Field names are case-insensitive but must match the struct definition (e.g., "toWalletAddress" is valid; "address" is not unless the struct has that field).
    - Follow the Go struct hierarchy strictly.
@@ -137,19 +184,10 @@ The selected API endpoint is: "%s %s"
          ]
        }
 
-4. **Event Payload Rules**
-   - If user asks for *event* payload or mentions "event":
-     - Populate inside 'payload -> event'
-     - For example, if user says "create event payload with id and type", then include:
-       "payload": {
-         "event": [
-           {
-             "id": "dummy",
-             "type": "dummy",
-             "eventType": "dummy"
-           }
-         ]
-       }
+4. **Event Payload Rules - DO NOT APPLY TO REQUEST PAYLOAD**
+   - Event payload is generated SEPARATELY and should NOT be included in the request payload.
+   - DO NOT populate event fields in the request payload.
+   - Event fields (id, type, eventType, timestamp, etc.) are handled in a separate event payload generation step.
 
 5. **Hierarchy Rules**
    - Respect nesting levels such as context → payload → tokenizedAsset → meta, etc.
@@ -208,8 +246,11 @@ The selected API endpoint is: "%s %s"
 ---
 
 ### OUTPUT
-Generate only the payload (JSON or XML as per user request). Add explanations, notes, or comments and ask questions as well.
-`, user, getRequestModelSnippet(), chosen.Method, chosen.Path)
+Generate only the REQUEST payload (JSON or XML as per user request). 
+- Include ONLY the fields specified for the request payload.
+- DO NOT include any event fields.
+- Do not add explanations, notes, or comments. Just return the payload.
+`, user, requestFieldsList, eventFieldsWarning, getRequestModelSnippet(), chosen.Method, chosen.Path)
 
 	payloadResp, err := llms.GenerateFromSinglePrompt(ctx, llm, payloadPrompt,
 		llms.WithTemperature(0.2))
@@ -575,6 +616,55 @@ type QueryInfo struct {
 	IsPrivate      *bool   // nil = unknown, true = private, false = public
 	FieldNames     []string // empty = no fields provided
 	EventFields    []string // fields for event payload (when async is true)
+	Operation      string   // operation type: "create"/"issue", "burn"/"manage", "trade"/"settle", or empty
+	UseCase        string   // usecase type: "insurance", "fd", "gold bond", etc.
+}
+
+// getUsecaseFields returns typical fields for a given usecase
+func getUsecaseFields(usecase string, operation string) []string {
+	usecase = strings.ToLower(usecase)
+	operation = strings.ToLower(operation)
+	
+	// Map of usecase -> operation -> fields
+	usecaseFieldMap := map[string]map[string][]string{
+		"insurance": {
+			"create": []string{"startYear", "endYear", "policyNumber", "premium", "coverageAmount", "type"},
+			"burn":   []string{"policyNumber", "type", "id"},
+			"trade":  []string{"policyNumber", "type", "id", "value"},
+		},
+		"fd": {
+			"create": []string{"principal", "interestRate", "tenure", "maturityDate", "type"},
+			"burn":   []string{"id", "type", "principal"},
+			"trade":  []string{"id", "type", "value", "principal"},
+		},
+		"gold bond": {
+			"create": []string{"quantity", "purity", "price", "type", "id"},
+			"burn":   []string{"id", "type", "quantity"},
+			"trade":  []string{"id", "type", "value", "quantity"},
+		},
+		"bond": {
+			"create": []string{"quantity", "purity", "price", "type", "id"},
+			"burn":   []string{"id", "type", "quantity"},
+			"trade":  []string{"id", "type", "value", "quantity"},
+		},
+		"mutual fund": {
+			"create": []string{"units", "nav", "investmentAmount", "type", "id"},
+			"burn":   []string{"id", "type", "units"},
+			"trade":  []string{"id", "type", "value", "units"},
+		},
+	}
+	
+	if opMap, ok := usecaseFieldMap[usecase]; ok {
+		if fields, ok := opMap[operation]; ok {
+			return fields
+		}
+		// If operation not found, return default fields for the usecase
+		if fields, ok := opMap["create"]; ok {
+			return fields
+		}
+	}
+	
+	return []string{}
 }
 
 // ClassifyQuery determines if the user is asking to create something or asking about a field
@@ -606,12 +696,14 @@ func ClassifyQuery(ctx context.Context, userInput, history string, llm llms.Mode
 	
 	// Check if user is asking about a field (not creating)
 	classificationPrompt := fmt.Sprintf(`Analyze the following user query and determine:
-1. Is this asking to CREATE something (e.g., "I want to create a gold bond", "create asset", "make a transaction", "burn asset")
+1. Is this asking to CREATE something (e.g., "I want to create a gold bond", "create asset", "make a transaction", "burn asset", "build insurance usecase", "I want to build an fd usecase")
 2. Is this asking ABOUT a field or property (e.g., "what is toWalletAddress?", "explain id field", "what does async mean?")
-3. Is this providing answers to previous questions (e.g., "yes", "no", "async", "private", field names like "id", "value")
+3. Is this providing answers to previous questions (e.g., "yes", "no", "async", "private", field names like "id", "value", "create", "burn", "trade")
 
-IMPORTANT: If the user is providing answers to follow-up questions (like "yes", "no", "async", "private", or field names), 
-this is STILL a creation request continuation, NOT a field question.
+IMPORTANT: 
+- If the user is providing answers to follow-up questions (like "yes", "no", "async", "private", or field names, or operation types like "create"/"burn"/"trade"), 
+  this is STILL a creation request continuation, NOT a field question.
+- If user mentions "build X usecase" or "insurance usecase" or "fd usecase" → is_creation_request = true, is_relevant = true
 
 User query: %q
 Recent conversation (last 3-4 messages only): %s
@@ -625,8 +717,8 @@ Return ONLY a JSON object:
 
 Rules:
 - If asking "explain X" or "what is X" → is_creation_request = false, is_relevant = true
-- If asking to create/make/generate/burn/lock → is_creation_request = true, is_relevant = true
-- If providing answers to questions (yes/no/field names) → is_creation_request = true, is_relevant = true
+- If asking to create/make/generate/burn/lock/build usecase → is_creation_request = true, is_relevant = true
+- If providing answers to questions (yes/no/field names/operation types) → is_creation_request = true, is_relevant = true
 - If completely unrelated to APIs → is_relevant = false`, userInput, getRecentHistory(history, 3))
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, classificationPrompt, llms.WithTemperature(0.0))
@@ -750,14 +842,21 @@ CRITICAL RULES:
 - But DO use information from the CURRENT request's question-answer flow.
 
 Extract:
-1. Is it async? (look for "async", "asynchronous", or "yes"/"no" answers to async questions in current query AND conversation context)
-2. Is it UMI compliant? (look for "UMI compliant", "UMI", or "yes"/"no" answers to UMI questions in current query AND conversation context)
-3. Is it private or public? (look for "private", "public", or answers to private/public questions in current query AND conversation context)
-4. Field names mentioned for main payload (any field names like id, value, key, toWalletAddress, etc. in current query AND conversation context)
-5. Event field names mentioned (if async is true, look for event-related fields like id, type, eventType, timestamp, etc. in current query AND conversation context)
+1. Usecase type (if user mentions building a usecase like "insurance", "fd", "gold bond", "mutual fund", etc. in current query OR conversation context)
+2. Operation type (if user mentions operation in current query OR conversation context:
+   - "create" or "issue" → set operation to "create"
+   - "burn" or "manage" → set operation to "burn"
+   - "trade" or "settle" → set operation to "trade")
+3. Is it async? (look for "async", "asynchronous", or "yes"/"no" answers to async questions in current query AND conversation context)
+4. Is it UMI compliant? (look for "UMI compliant", "UMI", or "yes"/"no" answers to UMI questions in current query AND conversation context)
+5. Is it private or public? (look for "private", "public", or answers to private/public questions in current query AND conversation context)
+6. Field names for REQUEST payload (CRITICAL: Only fields mentioned for "request payload", "main payload", "payload", or fields mentioned BEFORE event fields are discussed. Do NOT include event fields here.)
+7. Event field names (CRITICAL: Only fields mentioned AFTER user talks about "event payload", "event", or explicitly says "event will have". These are SEPARATE from request payload fields.)
 
 Return ONLY a JSON object:
 {
+  "usecase": "insurance"/"fd"/"gold bond"/etc. or null,
+  "operation": "create"/"burn"/"trade" or null,
   "is_async": true/false/null,
   "is_umi_compliant": true/false/null,
   "is_private": true/false/null,
@@ -765,10 +864,17 @@ Return ONLY a JSON object:
   "event_fields": ["eventField1", "eventField2", ...]
 }
 
-IMPORTANT: 
+CRITICAL SEPARATION RULES:
+- Request payload fields (field_names) and event payload fields (event_fields) are COMPLETELY SEPARATE.
+- If user says "request payload will have X, Y, Z" → put X, Y, Z in field_names ONLY.
+- If user says "event will have A, B, C" → put A, B, C in event_fields ONLY.
+- If user mentions fields without specifying "request" or "event", look at context:
+  * Fields mentioned BEFORE event discussion → field_names
+  * Fields mentioned AFTER event discussion or with "event" keyword → event_fields
+- DO NOT mix them. If user provides both, they must be in separate arrays.
 - If this is a continuation, extract from BOTH current query AND conversation context.
 - Use null ONLY if the information is truly not found in the current request's conversation flow.
-- For event_fields, only include if is_async is true or if user mentions event fields.`, userInput, contextMsg)
+- For event_fields, only include if is_async is true or if user explicitly mentions event fields.`, userInput, contextMsg)
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, extractionPrompt, llms.WithTemperature(0.0))
 	if err != nil {
@@ -777,6 +883,8 @@ IMPORTANT:
 	}
 
 	var result struct {
+		UseCase        string   `json:"usecase"`
+		Operation      string   `json:"operation"`
 		IsAsync        *bool    `json:"is_async"`
 		IsUMICompliant *bool    `json:"is_umi_compliant"`
 		IsPrivate      *bool    `json:"is_private"`
@@ -790,6 +898,8 @@ IMPORTANT:
 	}
 
 	info := &QueryInfo{
+		UseCase:        result.UseCase,
+		Operation:      result.Operation,
 		IsAsync:        result.IsAsync,
 		IsUMICompliant: result.IsUMICompliant,
 		IsPrivate:      result.IsPrivate,
@@ -797,11 +907,43 @@ IMPORTANT:
 		EventFields:    result.EventFields,
 	}
 	
+	// If usecase is detected and no fields provided, suggest usecase-specific fields
+	if info.UseCase != "" && len(info.FieldNames) == 0 {
+		// Determine operation (default to "create" if not specified)
+		op := info.Operation
+		if op == "" {
+			op = "create"
+		}
+		suggestedFields := getUsecaseFields(info.UseCase, op)
+		if len(suggestedFields) > 0 {
+			// Add suggested fields to FieldNames
+			info.FieldNames = suggestedFields
+		}
+	}
+	
 	// If extraction failed, use fallback
-	if info.IsAsync == nil && info.IsUMICompliant == nil && info.IsPrivate == nil && len(info.FieldNames) == 0 {
+	if info.IsAsync == nil && info.IsUMICompliant == nil && info.IsPrivate == nil && len(info.FieldNames) == 0 && info.UseCase == "" {
 		fallbackInfo := extractQueryInfoFallback(userInput, contextToUse)
 		if fallbackInfo != nil {
-			info = fallbackInfo
+			// Merge fallback info but preserve usecase/operation if already extracted
+			if info.UseCase == "" {
+				info.UseCase = fallbackInfo.UseCase
+			}
+			if info.Operation == "" {
+				info.Operation = fallbackInfo.Operation
+			}
+			if info.IsAsync == nil {
+				info.IsAsync = fallbackInfo.IsAsync
+			}
+			if info.IsUMICompliant == nil {
+				info.IsUMICompliant = fallbackInfo.IsUMICompliant
+			}
+			if info.IsPrivate == nil {
+				info.IsPrivate = fallbackInfo.IsPrivate
+			}
+			if len(info.FieldNames) == 0 {
+				info.FieldNames = fallbackInfo.FieldNames
+			}
 		}
 	}
 	
@@ -818,6 +960,33 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		textToAnalyze = context + " " + userInput
 	}
 	lower := strings.ToLower(textToAnalyze)
+	
+	// Extract usecase type
+	usecaseKeywords := map[string]string{
+		"insurance": "insurance",
+		"fd": "fd",
+		"fixed deposit": "fd",
+		"gold bond": "gold bond",
+		"bond": "bond",
+		"mutual fund": "mutual fund",
+		"mf": "mutual fund",
+	}
+	for keyword, usecase := range usecaseKeywords {
+		if (strings.Contains(lower, keyword) && strings.Contains(lower, "usecase")) || 
+			(strings.Contains(lower, "build") && strings.Contains(lower, keyword)) {
+			info.UseCase = usecase
+			break
+		}
+	}
+	
+	// Extract operation type
+	if strings.Contains(lower, "create") || strings.Contains(lower, "issue") {
+		info.Operation = "create"
+	} else if strings.Contains(lower, "burn") || strings.Contains(lower, "manage") {
+		info.Operation = "burn"
+	} else if strings.Contains(lower, "trade") || strings.Contains(lower, "settle") {
+		info.Operation = "trade"
+	}
 	
 	// Check for async - look for explicit mentions or yes/no answers to async questions
 	if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
@@ -893,12 +1062,27 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 	
 	// Extract field names - be more careful
 	commonFields := []string{"id", "value", "key", "toWalletAddress", "fromWalletAddress", 
-		"walletAddress", "requestId", "msgId", "name", "type", "event", "eventType"}
+		"walletAddress", "requestId", "msgId", "name", "type", "event", "eventType",
+		"startYear", "endYear", "policyNumber", "premium", "coverageAmount",
+		"principal", "interestRate", "tenure", "maturityDate",
+		"quantity", "purity", "price", "units", "nav", "investmentAmount"}
 	for _, field := range commonFields {
 		// Check if field is mentioned as a field name, not just in explanation
 		if strings.Contains(lower, field) && !strings.Contains(lower, "explain "+field) &&
 			!strings.Contains(lower, "what is "+field) {
 			info.FieldNames = append(info.FieldNames, field)
+		}
+	}
+	
+	// If usecase is detected and no fields found, suggest usecase-specific fields
+	if info.UseCase != "" && len(info.FieldNames) == 0 {
+		op := info.Operation
+		if op == "" {
+			op = "create"
+		}
+		suggestedFields := getUsecaseFields(info.UseCase, op)
+		if len(suggestedFields) > 0 {
+			info.FieldNames = suggestedFields
 		}
 	}
 	
@@ -908,6 +1092,23 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 // GenerateFollowUpQuestions generates questions for missing information
 func GenerateFollowUpQuestions(ctx context.Context, info *QueryInfo, llm llms.Model) (string, error) {
 	var missing []string
+	
+	// If usecase is mentioned but operation is not specified, ask about operation first
+	if info.UseCase != "" && info.Operation == "" {
+		operationPrompt := fmt.Sprintf(`The user wants to build a %s usecase. Ask them which operation they want to perform:
+- Create/Issue (req issue API)
+- Burn/Manage (req manage API)
+- Trade/Settle (req settle API)
+
+Generate a friendly question asking which operation they want.`, info.UseCase)
+		
+		response, err := llms.GenerateFromSinglePrompt(ctx, llm, operationPrompt, llms.WithTemperature(0.3))
+		if err != nil {
+			missing = append(missing, fmt.Sprintf("Which operation do you want to perform for %s usecase? (create/issue, burn/manage, or trade/settle)", info.UseCase))
+		} else {
+			return strings.TrimSpace(response), nil
+		}
+	}
 	
 	if info.IsAsync == nil {
 		missing = append(missing, "Is this request async? (yes/no)")
@@ -919,12 +1120,27 @@ func GenerateFollowUpQuestions(ctx context.Context, info *QueryInfo, llm llms.Mo
 		missing = append(missing, "Is this private or public?")
 	}
 	if len(info.FieldNames) == 0 {
-		missing = append(missing, "Please provide at least one field name for the payload (e.g., id, value, key, toWalletAddress, etc.)")
+		// If usecase is known, suggest usecase-specific fields
+		if info.UseCase != "" {
+			op := info.Operation
+			if op == "" {
+				op = "create"
+			}
+			suggestedFields := getUsecaseFields(info.UseCase, op)
+			if len(suggestedFields) > 0 {
+				fieldsStr := strings.Join(suggestedFields, ", ")
+				missing = append(missing, fmt.Sprintf("For %s usecase (%s operation), please provide fields for the REQUEST payload. Suggested fields: %s", info.UseCase, op, fieldsStr))
+			} else {
+				missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, startYear, endYear, value, key, toWalletAddress, etc.)")
+			}
+		} else {
+			missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, startYear, endYear, value, key, toWalletAddress, etc.)")
+		}
 	}
 	
 	// If async is true, check if event fields are provided
 	if info.IsAsync != nil && *info.IsAsync && len(info.EventFields) == 0 {
-		missing = append(missing, "Since this is an async request, please provide at least one field name for the event payload (e.g., id, type, eventType, timestamp, etc.)")
+		missing = append(missing, "Since this is an async request, please provide at least one field name for the EVENT payload separately (e.g., id, type, eventType, timestamp, etc.). Note: Event payload fields are different from request payload fields.")
 	}
 
 	if len(missing) == 0 {
@@ -962,26 +1178,43 @@ func AnswerFieldQuestion(ctx context.Context, userInput, history string, llm llm
 		return "UMI stands for **Unified Market Interface**. It's a compliance standard that ensures interoperability and standardization across different market participants and systems. When a request is UMI compliant, it means it adheres to the Unified Market Interface specifications for data exchange and communication protocols.", nil
 	}
 	
-	// Check for async field question
+	// Check for async field question - provide UMI project-specific answer
 	if strings.Contains(lower, "async") && (strings.Contains(lower, "what is") || 
 		strings.Contains(lower, "explain") || strings.Contains(lower, "what does") ||
-		strings.Contains(lower, "field")) {
-		return "The **async** field (or **isAsync**) is a boolean flag in the request context that indicates whether the API request should be processed asynchronously. When set to `true`, the request is processed asynchronously, meaning the API will return immediately and process the request in the background. When set to `false` or omitted, the request is processed synchronously, meaning the API will wait for the operation to complete before returning a response.", nil
+		strings.Contains(lower, "field") || strings.Contains(lower, "sync vs async") ||
+		strings.Contains(lower, "sync versus async") || strings.Contains(lower, "difference")) {
+		return `In the UMI project, the **async** field (or **isAsync**) is a boolean flag in the request context that determines how the API request is processed.
+
+**Async Flow (isAsync = true):**
+1. FSP commits the transaction on DLT (Distributed Ledger Technology)
+2. Chaincode sends an event to FSP via gRPC
+3. FSP produces the event in Kafka
+4. Backend consumes the event from Kafka
+
+**Sync Flow (isAsync = false or omitted):**
+The API processes the request synchronously, waiting for the operation to complete before returning a response.
+
+When you set 'isAsync: true' in your request, the system follows the async flow where the transaction is committed on DLT first, then events are propagated through gRPC and Kafka for backend processing.`, nil
 	}
 	
 	// Don't use history for field questions - answer based on current question only
 	// This prevents confusion from previous questions
-	answerPrompt := fmt.Sprintf(`You are a helpful API documentation assistant. The user is asking about a field or property.
+	answerPrompt := fmt.Sprintf(`You are an AI agent for the UMI (Unified Market Interface) project. You provide answers ONLY related to this project.
 
 User question: %q
 
 IMPORTANT RULES:
-- If the user asks about "UMI" or "UMI compliant", explain that UMI stands for "Unified Market Interface" and it's a compliance standard.
-- If the user asks about "async" or "isAsync", explain it's a boolean flag for asynchronous processing.
+- You are an AI agent of the UMI project - give answers ONLY related to this project.
+- If the user asks about "UMI" or "UMI compliant", explain that UMI stands for "Unified Market Interface" and it's a compliance standard for this project.
+- If the user asks about "async" or "isAsync" or "sync vs async", explain the UMI project-specific flow:
+  * Async flow: FSP commits on DLT → Chaincode sends event to FSP via gRPC → FSP produces event in Kafka → Backend consumes from Kafka
+  * Sync flow: API processes synchronously, waiting for operation to complete
 - Answer ONLY the current question. Do NOT reference previous questions or answers.
-- Answer the question clearly and concisely.
-- Do NOT suggest any APIs or generate payloads.
-- Just explain what the field is, what it does, or answer their question directly.
+- Answer the question clearly and concisely with UMI project-specific context.
+- Do NOT suggest any APIs or generate payloads unless explicitly asked.
+- Just explain what the field is, what it does, or answer their question directly in the context of the UMI project.
+
+If the question is not related to the UMI project, politely redirect: "I'm an AI agent for the UMI project. I can only answer questions related to this project. How can I help you with UMI-related questions?"
 
 If you don't know the answer, say so politely.`, userInput)
 
