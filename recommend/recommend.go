@@ -907,19 +907,8 @@ CRITICAL SEPARATION RULES:
 		EventFields:    result.EventFields,
 	}
 	
-	// If usecase is detected and no fields provided, suggest usecase-specific fields
-	if info.UseCase != "" && len(info.FieldNames) == 0 {
-		// Determine operation (default to "create" if not specified)
-		op := info.Operation
-		if op == "" {
-			op = "create"
-		}
-		suggestedFields := getUsecaseFields(info.UseCase, op)
-		if len(suggestedFields) > 0 {
-			// Add suggested fields to FieldNames
-			info.FieldNames = suggestedFields
-		}
-	}
+	// Note: We don't auto-populate usecase fields here to ensure all 4 questions are asked
+	// Usecase-specific fields will be suggested in the follow-up question instead
 	
 	// If extraction failed, use fallback
 	if info.IsAsync == nil && info.IsUMICompliant == nil && info.IsPrivate == nil && len(info.FieldNames) == 0 && info.UseCase == "" {
@@ -1074,17 +1063,9 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		}
 	}
 	
-	// If usecase is detected and no fields found, suggest usecase-specific fields
-	if info.UseCase != "" && len(info.FieldNames) == 0 {
-		op := info.Operation
-		if op == "" {
-			op = "create"
-		}
-		suggestedFields := getUsecaseFields(info.UseCase, op)
-		if len(suggestedFields) > 0 {
-			info.FieldNames = suggestedFields
-		}
-	}
+	// Note: We don't auto-populate usecase fields in fallback either
+	// This ensures all 4 questions (async, UMI, private/public, fields) are asked together
+	// Usecase-specific fields will be suggested in the follow-up question
 	
 	return info
 }
@@ -1147,15 +1128,39 @@ Generate a friendly question asking which operation they want.`, info.UseCase)
 		return "", nil
 	}
 
-	questionPrompt := fmt.Sprintf(`Generate a friendly, conversational follow-up question asking for the following missing information:
+	// Build a comprehensive question that asks for ALL missing information at once
+	// Count missing items for better formatting
+	numMissing := len(missing)
+	missingList := ""
+	for i, item := range missing {
+		if i == numMissing-1 && numMissing > 1 {
+			missingList += fmt.Sprintf("and %d. %s", i+1, item)
+		} else {
+			missingList += fmt.Sprintf("%d. %s\n", i+1, item)
+		}
+	}
+	
+	questionPrompt := fmt.Sprintf(`You are an API assistant. The user wants to create something, but you need %d pieces of information before you can proceed.
+
+Missing information:
 %s
 
-Return ONLY the question text, be concise and friendly.`, strings.Join(missing, "\n"))
+CRITICAL: Generate ONE single question that asks for ALL %d items above. 
+- DO NOT ask them one by one
+- DO NOT split into multiple questions
+- Ask for ALL items in a single, clear question
+- Format it like: "To proceed, I need the following: 1) [item 1], 2) [item 2], 3) [item 3], 4) [item 4]. Please provide all of these."
+
+Return ONLY the single question text. Be friendly and clear.`, numMissing, missingList, numMissing)
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, questionPrompt, llms.WithTemperature(0.3))
 	if err != nil {
-		// Fallback: simple question
-		return "To help you better, I need a few more details:\n" + strings.Join(missing, "\n"), nil
+		// Fallback: format all missing items in one clear question
+		formattedMissing := ""
+		for i, item := range missing {
+			formattedMissing += fmt.Sprintf("%d. %s\n", i+1, item)
+		}
+		return fmt.Sprintf("To proceed with your request, I need the following information:\n%sPlease provide all of these details at once.", formattedMissing), nil
 	}
 
 	return strings.TrimSpace(response), nil
