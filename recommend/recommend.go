@@ -160,14 +160,15 @@ The selected API endpoint is: "%s %s"
        - JSON: '{ "context": { "isAsync": true } }'
        - XML: '<context><isAsync>true</isAsync></context>'
 
-2. **Field population logic - REQUEST PAYLOAD ONLY**
-   - ONLY include fields that were explicitly mentioned for the REQUEST payload (not event payload).
-   - Populate only those fields explicitly mentioned by the user for the REQUEST payload that exist *exactly* in the request struct.
+2. **Field population logic - REQUEST PAYLOAD ONLY - STRICT RULES**
+   - ONLY include fields that were explicitly mentioned by the user for the REQUEST payload.
+   - DO NOT create or add fields on your own. Only use fields the user provided.
+   - Populate only those fields explicitly mentioned by the user that exist *exactly* in the TokenizedAsset struct (or other relevant structs in the request model).
    - DO NOT include any event-related fields (id, type, eventType, timestamp, etc.) in the request payload.
-   - If user is mentioning any unrelated or unspecified field then keep that in details field of meta as name and give value as any dummy.
-   - Field names are case-insensitive but must match the struct definition (e.g., "toWalletAddress" is valid; "address" is not unless the struct has that field).
-   - Follow the Go struct hierarchy strictly.
-   - If the user is not mentioning any field then don't populate anything, keep the whole request payload empty everytime
+   - CRITICAL: If user provides a field that does NOT exist in the TokenizedAsset struct (like purity, quantity, price, type if they're not in the struct), put it in meta.details as a key-value pair: {"name": "<field>", "value": "<dummy_value>"}
+   - Field names are case-insensitive but must match the struct definition exactly.
+   - Follow the Go struct hierarchy strictly - only use fields that exist in the struct definitions provided.
+   - If the user provides no fields, return an empty payload (no payload at all).
 
 3. **Tokenized Asset Rules**
    - If user asks to *create*, *lock*, or *burn* an asset:
@@ -221,18 +222,26 @@ The selected API endpoint is: "%s %s"
    - If the user mentions public data:
      - Do **not** include source or destination.
 
-7. **Unknown Fields Handling**
-   - If the user mentions a field that does not exist in the struct (e.g., "address", "key", or "customData"), include it inside:
-     meta.details → as a list of { "name": "<field>", "value": "<dummy_value>" }.
-   - Example:
+7. **Unknown Fields Handling - CRITICAL**
+   - If the user provides a field that does NOT exist in the TokenizedAsset struct (check the struct definition carefully):
+     - Put it in meta.details as: { "name": "<field>", "value": "<dummy_value>" }
+   - Examples of fields that might NOT be in TokenizedAsset: purity, quantity, price (if not in struct), startYear, endYear, policyNumber, etc.
+   - Example for unknown fields:
      {
-       "meta": {
-         "details": [
-           { "name": "address", "value": "user_provided_value" },
-           { "name": "key", "value": "dummy_key_value" }
+       "payload": {
+         "tokenizedAsset": [
+           {
+             "meta": {
+               "details": [
+                 { "name": "purity", "value": "24k" },
+                 { "name": "quantity", "value": "100" }
+               ]
+             }
+           }
          ]
        }
      }
+   - ONLY fields that exist in TokenizedAsset struct should be at the tokenizedAsset level directly.
 
 
 8. **If the user provides no field**
@@ -801,6 +810,7 @@ func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.M
 	var contextToUse string
 	if isNewRequest {
 		// For new requests, completely ignore history - start fresh
+		// This ensures event fields from previous requests are not carried over
 		contextToUse = ""
 	} else {
 		// For continuation of same request, use the provided history (which should include Q&A)
@@ -811,7 +821,7 @@ func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.M
 	// Build context message
 	contextMsg := ""
 	if contextToUse == "" {
-		contextMsg = "Previous conversation context: IGNORE - this is a new request, start fresh."
+		contextMsg = "Previous conversation context: IGNORE - this is a new request, start fresh. Do NOT extract event_fields from previous requests. If async is true in this new request, event_fields should be empty (will be asked separately)."
 	} else {
 		contextMsg = fmt.Sprintf(`Recent conversation context (this is a CONTINUATION - user is answering questions):
 %s
@@ -821,6 +831,7 @@ IMPORTANT: Look for question-answer pairs. For example:
 - If you see "Is this UMI compliant?" followed by "yes" or "no" → extract that answer  
 - If you see "Is this private or public?" followed by "private" or "public" → extract that answer
 - If you see field names mentioned → extract them
+- For event_fields: only extract if user explicitly mentions event fields in THIS request's conversation
 
 Extract information from BOTH the current query AND the conversation context above.`, contextToUse)
 	}
@@ -874,7 +885,10 @@ CRITICAL SEPARATION RULES:
 - DO NOT mix them. If user provides both, they must be in separate arrays.
 - If this is a continuation, extract from BOTH current query AND conversation context.
 - Use null ONLY if the information is truly not found in the current request's conversation flow.
-- For event_fields, only include if is_async is true or if user explicitly mentions event fields.`, userInput, contextMsg)
+- For event_fields: 
+  * If this is a NEW request and is_async is true, leave event_fields as empty array [] (they will be asked separately)
+  * If this is a CONTINUATION and is_async is true, only include event_fields if user explicitly provided them in the conversation
+  * Do NOT carry over event_fields from previous unrelated requests`, userInput, contextMsg)
 
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, extractionPrompt, llms.WithTemperature(0.0))
 	if err != nil {
@@ -1101,7 +1115,7 @@ Generate a friendly question asking which operation they want.`, info.UseCase)
 		missing = append(missing, "Is this private or public?")
 	}
 	if len(info.FieldNames) == 0 {
-		// If usecase is known, suggest usecase-specific fields
+		// If usecase is known, suggest usecase-specific fields (but don't require all of them)
 		if info.UseCase != "" {
 			op := info.Operation
 			if op == "" {
@@ -1110,12 +1124,12 @@ Generate a friendly question asking which operation they want.`, info.UseCase)
 			suggestedFields := getUsecaseFields(info.UseCase, op)
 			if len(suggestedFields) > 0 {
 				fieldsStr := strings.Join(suggestedFields, ", ")
-				missing = append(missing, fmt.Sprintf("For %s usecase (%s operation), please provide fields for the REQUEST payload. Suggested fields: %s", info.UseCase, op, fieldsStr))
+				missing = append(missing, fmt.Sprintf("Please provide at least one field name for the REQUEST payload. Suggested fields for %s (%s): %s", info.UseCase, op, fieldsStr))
 			} else {
-				missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, startYear, endYear, value, key, toWalletAddress, etc.)")
+				missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, value, etc.)")
 			}
 		} else {
-			missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, startYear, endYear, value, key, toWalletAddress, etc.)")
+			missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, value, etc.)")
 		}
 	}
 	
