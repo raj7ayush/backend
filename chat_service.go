@@ -130,7 +130,7 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 		// User wants to create something - detect if this is a new request
 		// A new request typically starts with creation keywords
 		isNewRequest := isNewCreationRequest(userInput, history)
-		
+
 		// For continuation (answering questions), use more history to capture previous Q&A
 		// For new requests, use less history
 		var recentHistory string
@@ -141,7 +141,7 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 			// Continuation - use more history to capture the questions and answers
 			recentHistory = getRecentHistoryForContext(history, 10)
 		}
-		
+
 		// Extract query info - from current request context
 		queryInfo, err := recommend.ExtractQueryInfo(ctx, userInput, recentHistory, s.model, isNewRequest)
 		if err != nil {
@@ -156,14 +156,15 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 - To BURN/MANAGE %s → use **req manage** API  
 - To TRADE/SETTLE %s → use **req settle** API
 
-Please specify which operation you want to perform (create, burn, or trade), and I'll help you with the API and payload.`, queryInfo.UseCase, queryInfo.UseCase, queryInfo.UseCase, queryInfo.UseCase)
+Please specify which operation you want to perform (create, burn, or trade), and I'll help you with the API and payload.`,
+				queryInfo.UseCase, queryInfo.UseCase, queryInfo.UseCase, queryInfo.UseCase)
 		} else {
 			// Check if all required pieces of information are present
 			hasAllInfo := queryInfo.IsAsync != nil &&
 				queryInfo.IsUMICompliant != nil &&
 				queryInfo.IsPrivate != nil &&
 				len(queryInfo.FieldNames) > 0
-			
+
 			// If async is true, also need event fields
 			if queryInfo.IsAsync != nil && *queryInfo.IsAsync {
 				hasAllInfo = hasAllInfo && len(queryInfo.EventFields) > 0
@@ -177,14 +178,15 @@ Please specify which operation you want to perform (create, burn, or trade), and
 				}
 				response = questions
 			} else {
-			// All information is present - proceed with API recommendation
-			// Use recent history for context
-			prompt := composeConversationAwareRequest(recentHistory, userInput)
-			api, fields, samplePayload, eventPayload, err := recommend.Recommend1(ctx, s.apis, prompt, queryInfo)
-			if err != nil {
-				return "", trimmedSession, err
+				// All information is present - proceed with API recommendation
+				// Use recent history for context
+				prompt := composeConversationAwareRequest(recentHistory, userInput)
+				api, fields, samplePayload, eventPayload, err := recommend.Recommend1(ctx, s.apis, prompt, queryInfo)
+				if err != nil {
+					return "", trimmedSession, err
+				}
+				response = formatRecommendation(api, fields, samplePayload, eventPayload)
 			}
-			response = formatRecommendation(api, fields, samplePayload, eventPayload)
 		}
 	}
 
@@ -338,26 +340,26 @@ func getRecentHistoryForContext(history string, n int) string {
 	if history == "" {
 		return ""
 	}
-	
+
 	// Split by message pairs (Human/AI)
 	parts := strings.Split(history, "\n\n")
 	if len(parts) <= n {
 		return history
 	}
-	
+
 	// Get last N parts
 	start := len(parts) - n
 	if start < 0 {
 		start = 0
 	}
-	
+
 	return strings.Join(parts[start:], "\n\n")
 }
 
 // isNewCreationRequest detects if this is a new creation request (not a continuation)
 func isNewCreationRequest(userInput, history string) bool {
 	lower := strings.ToLower(userInput)
-	
+
 	// Check for creation keywords that indicate a new request
 	creationKeywords := []string{"create", "make", "generate", "build", "new", "want to", "need to", "burn", "lock"}
 	for _, keyword := range creationKeywords {
@@ -366,22 +368,22 @@ func isNewCreationRequest(userInput, history string) bool {
 			// If it contains creation keywords and is not just "yes"/"no", it's a new request
 			isJustAnswer := strings.Contains(lower, "yes") || strings.Contains(lower, "no")
 			// Also check if it's a full sentence with creation intent
-			hasCreationIntent := strings.Contains(lower, keyword) && 
-				(strings.Contains(lower, "asset") || strings.Contains(lower, "bond") || 
-				 strings.Contains(lower, "transaction") || strings.Contains(lower, "gold") ||
-				 strings.Contains(lower, "token"))
-			
+			hasCreationIntent := strings.Contains(lower, keyword) &&
+				(strings.Contains(lower, "asset") || strings.Contains(lower, "bond") ||
+					strings.Contains(lower, "transaction") || strings.Contains(lower, "gold") ||
+					strings.Contains(lower, "token"))
+
 			if hasCreationIntent || (!isJustAnswer && len(strings.Fields(lower)) > 2) {
 				return true
 			}
 		}
 	}
-	
+
 	// If it's a short answer (yes/no/field names), it's likely a continuation
 	if len(strings.Fields(lower)) <= 3 {
 		return false
 	}
-	
+
 	return false
 }
 
@@ -400,7 +402,7 @@ func formatRecommendation(api apiparser.APIDoc, fields []apiparser.APIField, sam
 	}
 
 	samplePayload = strings.TrimSpace(samplePayload)
-	
+
 	if samplePayload != "" {
 		builder.WriteString("Sample payload:\n")
 		builder.WriteString(samplePayload)
@@ -408,7 +410,7 @@ func formatRecommendation(api apiparser.APIDoc, fields []apiparser.APIField, sam
 			builder.WriteString("\n")
 		}
 	}
-	
+
 	eventPayload = strings.TrimSpace(eventPayload)
 	if eventPayload != "" {
 		builder.WriteString("\nEvent payload (for async requests):\n")
