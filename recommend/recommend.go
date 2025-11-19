@@ -38,15 +38,15 @@ func Recommend1(ctx context.Context, apis []model.APIDoc, user string, queryInfo
 		if queryInfo.Operation != "" {
 			operationMap := map[string]string{
 				"create": "req issue",
-				"burn": "req manage",
-				"trade": "req settle",
+				"burn":   "req manage",
+				"trade":  "req settle",
 			}
 			if apiType, ok := operationMap[queryInfo.Operation]; ok {
 				enhancedUserRequest = fmt.Sprintf("%s (operation: %s, API type: %s)", enhancedUserRequest, queryInfo.Operation, apiType)
 			}
 		}
 	}
-	
+
 	pickPrompt := fmt.Sprintf(`You are selecting the best API for the user's request in the UMI project.
 
 APIs:
@@ -79,7 +79,7 @@ Return ONLY valid JSON with shape: {"api_index": <int>}
 		return model.APIDoc{}, nil, "", "", errors.New("api_index out of range")
 	}
 	chosen := apis[step1.APIIndex]
-		
+
 	fieldSummaries := make([]string, len(chosen.Fields))
 	for i, f := range chosen.Fields {
 		fieldSummaries[i] = fmt.Sprintf("[%d] %s (%s) - %s", i, f.Name, f.Type, f.Description)
@@ -127,13 +127,13 @@ Return ONLY valid JSON with shape: {"field_index": [<int>, ...]}
 		}
 		requestFieldsList = fmt.Sprintf("\n\n### CRITICAL: Fields for REQUEST PAYLOAD ONLY%s\nUse ONLY these fields in the request payload: %s\nDO NOT include any event-related fields (id, type, eventType, timestamp, etc.) in the request payload.\nEvent fields will be handled separately in the event payload.", usecaseContext, strings.Join(queryInfo.FieldNames, ", "))
 	}
-	
+
 	// Warn if event fields are present (they should not be in request payload)
 	eventFieldsWarning := ""
 	if queryInfo != nil && len(queryInfo.EventFields) > 0 {
 		eventFieldsWarning = fmt.Sprintf("\n\n### CRITICAL: DO NOT INCLUDE EVENT FIELDS IN REQUEST PAYLOAD\nThe following fields are for EVENT payload ONLY (not request payload): %s\nThese fields should NOT appear in the request payload you generate.", strings.Join(queryInfo.EventFields, ", "))
 	}
-	
+
 	payloadPrompt := fmt.Sprintf(`
 You are a senior Go developer responsible for generating a precise, valid sample request payload for an API.
 
@@ -268,7 +268,7 @@ Generate only the REQUEST payload (JSON or XML as per user request).
 	}
 
 	samplePayload := strings.TrimSpace(payloadResp)
-	
+
 	// Generate event payload if async is true
 	var eventPayload string
 	if queryInfo != nil && queryInfo.IsAsync != nil && *queryInfo.IsAsync && len(queryInfo.EventFields) > 0 {
@@ -285,7 +285,7 @@ Generate only the REQUEST payload (JSON or XML as per user request).
 // generateEventPayload generates event payload based on provided event fields
 func generateEventPayload(ctx context.Context, llm llms.Model, eventFields []string) (string, error) {
 	fieldsStr := strings.Join(eventFields, ", ")
-	
+
 	eventPrompt := fmt.Sprintf(`Generate a JSON payload for an Event struct with the following fields: %s
 
 Event struct definition:
@@ -311,12 +311,12 @@ Rules:
 - The event should be wrapped in: {"payload": {"event": [<event object>]}}
 
 Return ONLY the JSON payload, no explanations.`, fieldsStr, fieldsStr)
-	
+
 	response, err := llms.GenerateFromSinglePrompt(ctx, llm, eventPrompt, llms.WithTemperature(0.2))
 	if err != nil {
 		return "", err
 	}
-	
+
 	return strings.TrimSpace(response), nil
 }
 
@@ -620,9 +620,9 @@ func HandleCreateAssetPrompt(ctx context.Context, prompt string, llm llms.Model)
 
 // QueryInfo tracks the required information for API recommendation
 type QueryInfo struct {
-	IsAsync        *bool   // nil = unknown, true/false = known
-	IsUMICompliant *bool   // nil = unknown, true/false = known
-	IsPrivate      *bool   // nil = unknown, true = private, false = public
+	IsAsync        *bool    // nil = unknown, true/false = known
+	IsUMICompliant *bool    // nil = unknown, true/false = known
+	IsPrivate      *bool    // nil = unknown, true = private, false = public
 	FieldNames     []string // empty = no fields provided
 	EventFields    []string // fields for event payload (when async is true)
 	Operation      string   // operation type: "create"/"issue", "burn"/"manage", "trade"/"settle", or empty
@@ -633,7 +633,7 @@ type QueryInfo struct {
 func getUsecaseFields(usecase string, operation string) []string {
 	usecase = strings.ToLower(usecase)
 	operation = strings.ToLower(operation)
-	
+
 	// Map of usecase -> operation -> fields
 	usecaseFieldMap := map[string]map[string][]string{
 		"insurance": {
@@ -662,7 +662,7 @@ func getUsecaseFields(usecase string, operation string) []string {
 			"trade":  []string{"id", "type", "value", "units"},
 		},
 	}
-	
+
 	if opMap, ok := usecaseFieldMap[usecase]; ok {
 		if fields, ok := opMap[operation]; ok {
 			return fields
@@ -672,7 +672,7 @@ func getUsecaseFields(usecase string, operation string) []string {
 			return fields
 		}
 	}
-	
+
 	return []string{}
 }
 
@@ -680,13 +680,13 @@ func getUsecaseFields(usecase string, operation string) []string {
 func ClassifyQuery(ctx context.Context, userInput, history string, llm llms.Model) (bool, bool, error) {
 	// First check: is this an irrelevant request (not API-related)?
 	lower := strings.ToLower(userInput)
-	
+
 	// Check for irrelevant requests (buying cars, etc.)
 	irrelevantKeywords := []string{"buy", "purchase", "sell", "lamborghini", "lamborgini", "car", "vehicle", "shopping"}
 	for _, keyword := range irrelevantKeywords {
 		if strings.Contains(lower, keyword) {
 			// Check if it's actually API-related (e.g., "buy asset" is relevant)
-			apiRelated := strings.Contains(lower, "asset") || strings.Contains(lower, "bond") || 
+			apiRelated := strings.Contains(lower, "asset") || strings.Contains(lower, "bond") ||
 				strings.Contains(lower, "token") || strings.Contains(lower, "transaction") ||
 				strings.Contains(lower, "api") || strings.Contains(lower, "payload")
 			if !apiRelated {
@@ -694,7 +694,7 @@ func ClassifyQuery(ctx context.Context, userInput, history string, llm llms.Mode
 			}
 		}
 	}
-	
+
 	// Check for explanation questions first (these should always be field questions)
 	explainKeywords := []string{"explain", "what is", "what does", "tell me about", "how does", "describe", "meaning of"}
 	for _, keyword := range explainKeywords {
@@ -702,7 +702,7 @@ func ClassifyQuery(ctx context.Context, userInput, history string, llm llms.Mode
 			return false, true, nil // Field question, relevant
 		}
 	}
-	
+
 	// Check if user is asking about a field (not creating)
 	classificationPrompt := fmt.Sprintf(`Analyze the following user query and determine:
 1. Is this asking to CREATE something (e.g., "I want to create a gold bond", "create asset", "make a transaction", "burn asset", "build insurance usecase", "I want to build an fd usecase")
@@ -756,7 +756,7 @@ Rules:
 // classifyQueryFallback provides fallback classification logic
 func classifyQueryFallback(userInput string) bool {
 	lower := strings.ToLower(userInput)
-	
+
 	// Explanation questions
 	explainKeywords := []string{"explain", "what is", "what does", "tell me about", "how does", "describe"}
 	for _, keyword := range explainKeywords {
@@ -764,7 +764,7 @@ func classifyQueryFallback(userInput string) bool {
 			return false
 		}
 	}
-	
+
 	// Creation keywords
 	creationKeywords := []string{"create", "make", "generate", "build", "new", "want to", "need to", "burn", "lock"}
 	for _, keyword := range creationKeywords {
@@ -772,13 +772,13 @@ func classifyQueryFallback(userInput string) bool {
 			return true
 		}
 	}
-	
+
 	// If it's just answers (yes/no/field names), treat as creation continuation
 	if len(strings.Fields(lower)) <= 3 {
 		// Short responses are likely answers to questions
 		return true
 	}
-	
+
 	return false
 }
 
@@ -787,18 +787,18 @@ func getRecentHistory(history string, n int) string {
 	if history == "" {
 		return ""
 	}
-	
+
 	lines := strings.Split(history, "\n")
 	if len(lines) <= n*2 { // Each message pair (Human + AI) is ~2 lines
 		return history
 	}
-	
+
 	// Get last N*2 lines (N message pairs)
 	start := len(lines) - (n * 2)
 	if start < 0 {
 		start = 0
 	}
-	
+
 	return strings.Join(lines[start:], "\n")
 }
 
@@ -817,7 +817,7 @@ func ExtractQueryInfo(ctx context.Context, userInput, history string, llm llms.M
 		// This is important to capture answers to previous questions
 		contextToUse = history
 	}
-	
+
 	// Build context message
 	contextMsg := ""
 	if contextToUse == "" {
@@ -835,7 +835,7 @@ IMPORTANT: Look for question-answer pairs. For example:
 
 Extract information from BOTH the current query AND the conversation context above.`, contextToUse)
 	}
-	
+
 	extractionPrompt := fmt.Sprintf(`Analyze the current creation request and extract the following information:
 
 Current user query: %q
@@ -920,10 +920,10 @@ CRITICAL SEPARATION RULES:
 		FieldNames:     result.FieldNames,
 		EventFields:    result.EventFields,
 	}
-	
+
 	// Note: We don't auto-populate usecase fields here to ensure all 4 questions are asked
 	// Usecase-specific fields will be suggested in the follow-up question instead
-	
+
 	// If extraction failed, use fallback
 	if info.IsAsync == nil && info.IsUMICompliant == nil && info.IsPrivate == nil && len(info.FieldNames) == 0 && info.UseCase == "" {
 		fallbackInfo := extractQueryInfoFallback(userInput, contextToUse)
@@ -949,7 +949,7 @@ CRITICAL SEPARATION RULES:
 			}
 		}
 	}
-	
+
 	return info, nil
 }
 
@@ -963,25 +963,25 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		textToAnalyze = context + " " + userInput
 	}
 	lower := strings.ToLower(textToAnalyze)
-	
+
 	// Extract usecase type
 	usecaseKeywords := map[string]string{
-		"insurance": "insurance",
-		"fd": "fd",
+		"insurance":     "insurance",
+		"fd":            "fd",
 		"fixed deposit": "fd",
-		"gold bond": "gold bond",
-		"bond": "bond",
-		"mutual fund": "mutual fund",
-		"mf": "mutual fund",
+		"gold bond":     "gold bond",
+		"bond":          "bond",
+		"mutual fund":   "mutual fund",
+		"mf":            "mutual fund",
 	}
 	for keyword, usecase := range usecaseKeywords {
-		if (strings.Contains(lower, keyword) && strings.Contains(lower, "usecase")) || 
+		if (strings.Contains(lower, keyword) && strings.Contains(lower, "usecase")) ||
 			(strings.Contains(lower, "build") && strings.Contains(lower, keyword)) {
 			info.UseCase = usecase
 			break
 		}
 	}
-	
+
 	// Extract operation type
 	if strings.Contains(lower, "create") || strings.Contains(lower, "issue") {
 		info.Operation = "create"
@@ -990,17 +990,17 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 	} else if strings.Contains(lower, "trade") || strings.Contains(lower, "settle") {
 		info.Operation = "trade"
 	}
-	
+
 	// Check for async - look for explicit mentions or yes/no answers to async questions
 	if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
 		// Check for negative indicators
-		asyncFalse := strings.Contains(lower, "not async") || 
-			strings.Contains(lower, "no async") || 
+		asyncFalse := strings.Contains(lower, "not async") ||
+			strings.Contains(lower, "no async") ||
 			strings.Contains(lower, "async: no") ||
 			strings.Contains(lower, "async=false") ||
 			strings.Contains(lower, "async no") ||
-			(strings.Contains(lower, "async") && strings.Contains(lower, "no") && 
-			 strings.Index(lower, "async") < strings.Index(lower, "no")+10)
+			(strings.Contains(lower, "async") && strings.Contains(lower, "no") &&
+				strings.Index(lower, "async") < strings.Index(lower, "no")+10)
 		if asyncFalse {
 			asyncFalseVal := false
 			info.IsAsync = &asyncFalseVal
@@ -1013,27 +1013,27 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		// Look for yes/no answers to async questions in context
 		// Pattern: question about async followed by yes/no
 		if (strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous")) &&
-			(strings.Contains(lower, " yes") || strings.Contains(lower, "\nyes") || 
-			 strings.Contains(lower, "yes\n") || strings.Contains(lower, "yes,")) {
+			(strings.Contains(lower, " yes") || strings.Contains(lower, "\nyes") ||
+				strings.Contains(lower, "yes\n") || strings.Contains(lower, "yes,")) {
 			asyncTrue := true
 			info.IsAsync = &asyncTrue
 		} else if (strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous")) &&
-			(strings.Contains(lower, " no") || strings.Contains(lower, "\nno") || 
-			 strings.Contains(lower, "no\n") || strings.Contains(lower, "no,")) {
+			(strings.Contains(lower, " no") || strings.Contains(lower, "\nno") ||
+				strings.Contains(lower, "no\n") || strings.Contains(lower, "no,")) {
 			asyncFalseVal := false
 			info.IsAsync = &asyncFalseVal
 		}
 	}
-	
+
 	// Check for UMI compliant - look for explicit mentions or yes/no answers
 	if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") {
-		umiFalse := strings.Contains(lower, "not umi") || 
-			strings.Contains(lower, "no umi") || 
+		umiFalse := strings.Contains(lower, "not umi") ||
+			strings.Contains(lower, "no umi") ||
 			strings.Contains(lower, "umi: no") ||
 			strings.Contains(lower, "umi=false") ||
 			strings.Contains(lower, "umi no") ||
-			(strings.Contains(lower, "umi") && strings.Contains(lower, "no") && 
-			 strings.Index(lower, "umi") < strings.Index(lower, "no")+15)
+			(strings.Contains(lower, "umi") && strings.Contains(lower, "no") &&
+				strings.Index(lower, "umi") < strings.Index(lower, "no")+15)
 		if umiFalse {
 			umiFalseVal := false
 			info.IsUMICompliant = &umiFalseVal
@@ -1043,17 +1043,17 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		}
 	} else if strings.Contains(lower, "umi") && !strings.Contains(lower, "explain") {
 		// Check for yes/no answers to UMI questions
-		if strings.Contains(lower, " yes") || strings.Contains(lower, "\nyes") || 
+		if strings.Contains(lower, " yes") || strings.Contains(lower, "\nyes") ||
 			strings.Contains(lower, "yes\n") || strings.Contains(lower, "yes,") {
 			umiTrue := true
 			info.IsUMICompliant = &umiTrue
-		} else if strings.Contains(lower, " no") || strings.Contains(lower, "\nno") || 
+		} else if strings.Contains(lower, " no") || strings.Contains(lower, "\nno") ||
 			strings.Contains(lower, "no\n") || strings.Contains(lower, "no,") {
 			umiFalseVal := false
 			info.IsUMICompliant = &umiFalseVal
 		}
 	}
-	
+
 	// Check for private/public
 	if strings.Contains(lower, "private") && !strings.Contains(lower, "public") {
 		privateTrue := true
@@ -1062,9 +1062,9 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 		privateFalse := false
 		info.IsPrivate = &privateFalse
 	}
-	
+
 	// Extract field names - be more careful
-	commonFields := []string{"id", "value", "key", "toWalletAddress", "fromWalletAddress", 
+	commonFields := []string{"id", "value", "key", "toWalletAddress", "fromWalletAddress",
 		"walletAddress", "requestId", "msgId", "name", "type", "event", "eventType",
 		"startYear", "endYear", "policyNumber", "premium", "coverageAmount",
 		"principal", "interestRate", "tenure", "maturityDate",
@@ -1076,35 +1076,36 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 			info.FieldNames = append(info.FieldNames, field)
 		}
 	}
-	
+
 	// Note: We don't auto-populate usecase fields in fallback either
 	// This ensures all 4 questions (async, UMI, private/public, fields) are asked together
 	// Usecase-specific fields will be suggested in the follow-up question
-	
+
 	return info
 }
 
 // GenerateFollowUpQuestions generates questions for missing information
 func GenerateFollowUpQuestions(ctx context.Context, info *QueryInfo, llm llms.Model) (string, error) {
-	var missing []string
-	
-	// If usecase is mentioned but operation is not specified, ask about operation first
+	// If usecase is mentioned but operation is not specified, ask about operation FIRST
+	// Do NOT ask the 4 questions until operation is selected
 	if info.UseCase != "" && info.Operation == "" {
 		operationPrompt := fmt.Sprintf(`The user wants to build a %s usecase. Ask them which operation they want to perform:
 - Create/Issue (req issue API)
 - Burn/Manage (req manage API)
 - Trade/Settle (req settle API)
 
-Generate a friendly question asking which operation they want.`, info.UseCase)
-		
+Generate a friendly question asking which operation they want. Return ONLY the question.`, info.UseCase)
+
 		response, err := llms.GenerateFromSinglePrompt(ctx, llm, operationPrompt, llms.WithTemperature(0.3))
 		if err != nil {
-			missing = append(missing, fmt.Sprintf("Which operation do you want to perform for %s usecase? (create/issue, burn/manage, or trade/settle)", info.UseCase))
-		} else {
-			return strings.TrimSpace(response), nil
+			// Fallback: return a clear question about operation
+			return fmt.Sprintf("For %s usecase, which operation do you want to perform?\n\n- CREATE/ISSUE → use req issue API\n- BURN/MANAGE → use req manage API\n- TRADE/SETTLE → use req settle API\n\nPlease specify: create, burn, or trade", info.UseCase), nil
 		}
+		return strings.TrimSpace(response), nil
 	}
-	
+
+	var missing []string
+
 	if info.IsAsync == nil {
 		missing = append(missing, "Is this request async? (yes/no)")
 	}
@@ -1132,7 +1133,7 @@ Generate a friendly question asking which operation they want.`, info.UseCase)
 			missing = append(missing, "Please provide at least one field name for the REQUEST payload (e.g., id, type, value, etc.)")
 		}
 	}
-	
+
 	// If async is true, check if event fields are provided
 	if info.IsAsync != nil && *info.IsAsync && len(info.EventFields) == 0 {
 		missing = append(missing, "Since this is an async request, please provide at least one field name for the EVENT payload separately (e.g., id, type, eventType, timestamp, etc.). Note: Event payload fields are different from request payload fields.")
@@ -1153,7 +1154,7 @@ Generate a friendly question asking which operation they want.`, info.UseCase)
 			missingList += fmt.Sprintf("%d. %s\n", i+1, item)
 		}
 	}
-	
+
 	questionPrompt := fmt.Sprintf(`You are an API assistant. The user wants to create something, but you need %d pieces of information before you can proceed.
 
 Missing information:
@@ -1184,21 +1185,21 @@ Return ONLY the single question text. Be friendly and clear.`, numMissing, missi
 func AnswerFieldQuestion(ctx context.Context, userInput, history string, llm llms.Model) (string, error) {
 	// Check if user is asking about UMI specifically
 	lower := strings.ToLower(userInput)
-	
+
 	// Check for "UMI compliant" vs just "UMI"
 	if strings.Contains(lower, "umi compliant") || strings.Contains(lower, "umi-compliant") {
 		return "UMI compliant means that a request adheres to the **Unified Market Interface** (UMI) compliance standard. UMI is a standard that ensures interoperability and standardization across different market participants and systems. When a request is UMI compliant, it means it follows the Unified Market Interface specifications for data exchange and communication protocols.", nil
 	}
-	
-	if strings.Contains(lower, "umi") && (strings.Contains(lower, "explain") || 
+
+	if strings.Contains(lower, "umi") && (strings.Contains(lower, "explain") ||
 		strings.Contains(lower, "what is") || strings.Contains(lower, "what does") ||
 		strings.Contains(lower, "meaning") || strings.Contains(lower, "stand for") ||
 		strings.Contains(lower, "full form") || strings.Contains(lower, "fullform")) {
 		return "UMI stands for **Unified Market Interface**. It's a compliance standard that ensures interoperability and standardization across different market participants and systems. When a request is UMI compliant, it means it adheres to the Unified Market Interface specifications for data exchange and communication protocols.", nil
 	}
-	
+
 	// Check for async field question - provide UMI project-specific answer
-	if strings.Contains(lower, "async") && (strings.Contains(lower, "what is") || 
+	if strings.Contains(lower, "async") && (strings.Contains(lower, "what is") ||
 		strings.Contains(lower, "explain") || strings.Contains(lower, "what does") ||
 		strings.Contains(lower, "field") || strings.Contains(lower, "sync vs async") ||
 		strings.Contains(lower, "sync versus async") || strings.Contains(lower, "difference")) {
@@ -1215,7 +1216,7 @@ The API processes the request synchronously, waiting for the operation to comple
 
 When you set 'isAsync: true' in your request, the system follows the async flow where the transaction is committed on DLT first, then events are propagated through gRPC and Kafka for backend processing.`, nil
 	}
-	
+
 	// Don't use history for field questions - answer based on current question only
 	// This prevents confusion from previous questions
 	answerPrompt := fmt.Sprintf(`You are an AI agent for the UMI (Unified Market Interface) project. You provide answers ONLY related to this project.

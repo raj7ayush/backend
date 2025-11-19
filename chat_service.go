@@ -148,16 +148,16 @@ func (s *ChatService) ProcessMessage(ctx context.Context, sessionID, userInput s
 			return "", trimmedSession, fmt.Errorf("extract query info: %w", err)
 		}
 
-		// If usecase is mentioned but operation is not specified, explain which APIs to use
+		// If usecase is mentioned but operation is not specified, ask about operation FIRST
+		// Do NOT ask the 4 questions until operation is selected
 		if queryInfo.UseCase != "" && queryInfo.Operation == "" {
-			response = fmt.Sprintf(`For %s usecase, you can use different APIs based on the operation:
+			response = fmt.Sprintf(`For %s usecase, which operation do you want to perform?
 
-- To CREATE/ISSUE %s → use **req issue** API
-- To BURN/MANAGE %s → use **req manage** API  
-- To TRADE/SETTLE %s → use **req settle** API
+- CREATE/ISSUE → use **req issue** API
+- BURN/MANAGE → use **req manage** API  
+- TRADE/SETTLE → use **req settle** API
 
-Please specify which operation you want to perform (create, burn, or trade), and I'll help you with the API and payload.`,
-				queryInfo.UseCase, queryInfo.UseCase, queryInfo.UseCase, queryInfo.UseCase)
+Please specify: create, burn, or trade`, queryInfo.UseCase)
 		} else {
 			// Check if all required pieces of information are present
 			hasAllInfo := queryInfo.IsAsync != nil &&
