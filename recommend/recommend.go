@@ -844,6 +844,7 @@ Current user query: %q
 CRITICAL RULES:
 - If this is a NEW creation request (like "create gold bond" or "burn asset"), ONLY extract information from the current query.
 - If this is a CONTINUATION (user answering questions), extract from BOTH current query AND the conversation context above.
+- If user says "build X usecase" or "i want to build X usecase" WITHOUT explicitly mentioning async/UMI/private/fields → DO NOT extract those fields (leave them as null/empty). Only extract the usecase.
 - Look for question-answer patterns in the conversation:
   * "Is this async?" → look for "yes"/"no" answer → set is_async accordingly
   * "Is this UMI compliant?" → look for "yes"/"no" answer → set is_umi_compliant accordingly
@@ -854,14 +855,17 @@ CRITICAL RULES:
 
 Extract:
 1. Usecase type (if user mentions building a usecase like "insurance", "fd", "gold bond", "mutual fund", etc. in current query OR conversation context)
-2. Operation type (if user mentions operation in current query OR conversation context:
+2. Operation type (CRITICAL: Only extract if user EXPLICITLY mentions one of these operations:
    - "create" or "issue" → set operation to "create"
    - "burn" or "manage" → set operation to "burn"
-   - "trade" or "settle" → set operation to "trade")
-3. Is it async? (look for "async", "asynchronous", or "yes"/"no" answers to async questions in current query AND conversation context)
-4. Is it UMI compliant? (look for "UMI compliant", "UMI", or "yes"/"no" answers to UMI questions in current query AND conversation context)
-5. Is it private or public? (look for "private", "public", or answers to private/public questions in current query AND conversation context)
-6. Field names for REQUEST payload (CRITICAL: Only fields mentioned for "request payload", "main payload", "payload", or fields mentioned BEFORE event fields are discussed. Do NOT include event fields here.)
+   - "trade" or "settle" → set operation to "trade"
+   - DO NOT infer operation from "build" or "want to build" - these are just usecase requests, NOT operation specifications
+   - If user says "build insurance usecase" or "i want to build insurance usecase" → usecase = "insurance", operation = null (empty)
+   - If user says "build X usecase" without mentioning create/burn/trade → operation MUST be null/empty, NOT "create")
+3. Is it async? (look for "async", "asynchronous", or "yes"/"no" answers to async questions in current query AND conversation context. If user only says "build X usecase" without mentioning async → set to null)
+4. Is it UMI compliant? (look for "UMI compliant", "UMI", or "yes"/"no" answers to UMI questions in current query AND conversation context. If user only says "build X usecase" without mentioning UMI → set to null)
+5. Is it private or public? (look for "private", "public", or answers to private/public questions in current query AND conversation context. If user only says "build X usecase" without mentioning private/public → set to null)
+6. Field names for REQUEST payload (CRITICAL: Only fields mentioned for "request payload", "main payload", "payload", or fields mentioned BEFORE event fields are discussed. Do NOT include event fields here. If user only says "build X usecase" without mentioning any fields → set to empty array [])
 7. Event field names (CRITICAL: Only fields mentioned AFTER user talks about "event payload", "event", or explicitly says "event will have". These are SEPARATE from request payload fields.)
 
 Return ONLY a JSON object:
@@ -983,13 +987,22 @@ func extractQueryInfoFallback(userInput, context string) *QueryInfo {
 	}
 
 	// Extract operation type
-	if strings.Contains(lower, "create") || strings.Contains(lower, "issue") {
-		info.Operation = "create"
-	} else if strings.Contains(lower, "burn") || strings.Contains(lower, "manage") {
-		info.Operation = "burn"
-	} else if strings.Contains(lower, "trade") || strings.Contains(lower, "settle") {
-		info.Operation = "trade"
+	// CRITICAL: Do NOT infer operation from "build" - "build X usecase" is not an operation
+	// Check if this is a "build usecase" request - if so, don't extract operation
+	isBuildUsecaseRequest := strings.Contains(lower, "build") && 
+		(strings.Contains(lower, "usecase") || strings.Contains(lower, "use case"))
+	
+	// Only extract operation if it's explicitly mentioned AND not in "build usecase" context
+	if !isBuildUsecaseRequest {
+		if strings.Contains(lower, "create") || strings.Contains(lower, "issue") {
+			info.Operation = "create"
+		} else if strings.Contains(lower, "burn") || strings.Contains(lower, "manage") {
+			info.Operation = "burn"
+		} else if strings.Contains(lower, "trade") || strings.Contains(lower, "settle") {
+			info.Operation = "trade"
+		}
 	}
+	// If user says "build X usecase" without explicit operation, leave operation empty
 
 	// Check for async - look for explicit mentions or yes/no answers to async questions
 	if strings.Contains(lower, "async") || strings.Contains(lower, "asynchronous") {
